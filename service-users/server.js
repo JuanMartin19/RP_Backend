@@ -111,6 +111,63 @@ fastify.post('/auth/login', async (request, reply) => {
   }
 });
 
+// --- NUEVO: OBTENER TODOS LOS USUARIOS ---
+fastify.get('/users', async (request, reply) => {
+  try {
+    // Nota: Por ahora listamos todos. 
+    // Más adelante el API Gateway protegerá esta ruta para que solo entren los que tengan el permiso 'user:view'
+    
+    const { data: users, error } = await supabase
+      .from('usuarios')
+      .select('id, nombre_completo, username, email, fecha_inicio, last_login');
+
+    if (error) throw error;
+
+    reply.code(200);
+    return buildResponse(200, 'SxUS200', users);
+
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500);
+    return buildResponse(500, 'SxUS500', { message: 'Error al obtener usuarios' });
+  }
+});
+
+// --- NUEVO: EDITAR UN PERFIL DE USUARIO ---
+fastify.patch('/users/:id', async (request, reply) => {
+  const userId = request.params.id; // El ID viene en la URL (ej. /users/123)
+  const updates = request.body; // Los campos a actualizar (nombre_completo, telefono, etc.)
+
+  // Prevenir que intenten cambiar el ID o la contraseña desde aquí
+  delete updates.id;
+  delete updates.password; 
+
+  try {
+    const { data: updatedUser, error } = await supabase
+      .from('usuarios')
+      .update(updates)
+      .eq('id', userId)
+      .select()
+      .single();
+
+    if (error) {
+       reply.code(404); // 404 Not Found si el ID no existe
+       return buildResponse(404, 'SxUS404', { message: 'Usuario no encontrado o sin cambios' });
+    }
+
+    reply.code(200);
+    return buildResponse(200, 'SxUS200', {
+      message: 'Perfil actualizado correctamente',
+      user: updatedUser
+    });
+
+  } catch (err) {
+    fastify.log.error(err);
+    reply.code(500);
+    return buildResponse(500, 'SxUS500', { message: 'Error interno al actualizar usuario' });
+  }
+});
+
 // --- LEVANTAR SERVIDOR ---
 const start = async () => {
   try {
