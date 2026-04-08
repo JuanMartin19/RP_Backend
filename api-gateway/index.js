@@ -1,4 +1,3 @@
-// RP_Backend/api-gateway/index.js
 require('dotenv').config();
 const fastify = require('fastify')({ logger: true });
 const proxy = require('@fastify/http-proxy');
@@ -7,229 +6,180 @@ const { buildResponse } = require('../shared/responseHandler');
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// --- NUEVO: CONFIGURACIÓN DE RATE LIMITING ---
+// --- RATE LIMITING ---
 fastify.register(require('@fastify/rate-limit'), {
-  max: 100, // Máximo 100 peticiones
-  timeWindow: '1 minute', // En un lapso de 1 minuto
-  errorResponseBuilder: function (request, context) {
-    // Si se pasan de 100, devolvemos el error 429 con nuestro esquema JSON universal
-    return buildResponse(429, 'SxGW429', { message: 'Too many requests' });
-  }
-});
-// ---------------------------------------------
-
-// Configuración del Proxy (Redirigir tráfico a Users)
-fastify.register(proxy, {
-  upstream: 'http://localhost:3001',
-  prefix: '/users-service', 
-  rewritePrefix: '' 
+    max: 100,
+    timeWindow: '1 minute',
+    errorResponseBuilder: (request, context) => buildResponse(429, 'SxGW429', { message: 'Too many requests' })
 });
 
-fastify.register(proxy, {
-  upstream: 'http://localhost:3002',
-  prefix: '/groups-service', 
-  rewritePrefix: '' 
-});
+// --- PROXIES ---
+fastify.register(proxy, { upstream: 'http://localhost:3001', prefix: '/users-service', rewritePrefix: '' });
+fastify.register(proxy, { upstream: 'http://localhost:3002', prefix: '/groups-service', rewritePrefix: '' });
+fastify.register(proxy, { upstream: 'http://localhost:3003', prefix: '/tickets-service', rewritePrefix: '' });
 
-fastify.register(proxy, {
-  upstream: 'http://localhost:3003',
-  prefix: '/tickets-service', 
-  rewritePrefix: '' 
-});
+// --- LÓGICA DE SEGURIDAD: VERIFICACIÓN DE PERMISOS ---
+async function checkPermission(userId, grupoId, permisoRequerido) {
+    if (!grupoId || !permisoRequerido) return true; // Rutas globales (como login) no requieren grupo
 
-// Middleware (Hook) para validar el token
+    // El SuperAdmin de un módulo tiene el sufijo :manage
+    const modulo = permisoRequerido.split(':')[0]; // ej: 'ticket'
+    const permisoManage = `${modulo}:manage`;
+
+    const { data, error } = await supabase
+        .from('grupo_usuario_permisos')
+        .select(`
+            permisos!inner (
+                nombre
+            )
+        `)
+        .eq('usuario_id', userId)
+        .eq('grupo_id', grupoId)
+        .or(`nombre.eq.${permisoRequerido},nombre.eq.${permisoManage}`);
+
+    return data && data.length > 0;
+}
+
+// --- HOOK DE SEGURIDAD (PRE-HANDLER) ---
 fastify.addHook('preHandler', async (request, reply) => {
-  const isAuthRoute = request.url.includes('/auth/login') || request.url.includes('/auth/register');
-  if (isAuthRoute) return;
+    const isAuthRoute = request.url.includes('/auth/login') || request.url.includes('/auth/register');
+    if (isAuthRoute) return;
 
-  const authHeader = request.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    reply.code(401);
-    return buildResponse(401, 'SxGW401', { message: 'Token no proporcionado o formato inválido' });
-  }
-
-  const token = authHeader.split(' ')[1];
-
-  try {
-    const { data, error } = await supabase.auth.getUser(token);
-
-    if (error || !data.user) {
-      reply.code(403);
-      return buildResponse(403, 'SxGW403', { message: 'Token inválido o expirado' });
+    const authHeader = request.headers.authorization;
+    if (!authHeader) {
+        reply.code(401);
+        return buildResponse(401, 'SxGW401', { message: 'Token no proporcionado' });
     }
 
-    request.user = data.user; 
-  } catch (err) {
-    reply.code(500);
-    return buildResponse(500, 'SxGW500', { message: 'Error interno al validar token' });
-  }
+    const token = authHeader.split(' ')[1];
+
+    try {
+        // 1. Validar Token en Supabase
+        const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+        if (authError || !user) {
+            reply.code(403);
+            return buildResponse(403, 'SxGW403', { message: 'Token inválido o expirado' });
+        }
+        request.user = user;
+
+        // 2. MATRIZ DE PERMISOS (Asocia rutas con permisos específicos)
+        const permissionsMatrix = {
+            // TICKETS
+            '/tickets/create': 'ticket:add',
+            '/tickets/edit': 'ticket:edit',
+            '/tickets/status': 'ticket:edit:state',
+            '/tickets/comment': 'ticket:edit:comment',
+            '/tickets/delete': 'ticket:delete',
+            '/tickets/group': 'ticket:view',
+            // GROUPS
+            '/groups/all': 'group:view',
+            '/groups/edit': 'group:edit',
+            '/groups/delete': 'group:delete',
+            '/groups/permissions': 'group:manage',
+            // USERS
+            '/users': 'user:view'
+        };
+
+        // Encontrar si la ruta actual requiere un permiso
+        const matchedRoute = Object.keys(permissionsMatrix).find(route => request.url.includes(route));
+
+        if (matchedRoute) {
+            const requiredPermission = permissionsMatrix[matchedRoute];
+            
+            // Extraer grupo_id (puede estar en params, body o query)
+            const grupoId = request.body?.grupo_id || request.params?.grupo_id || request.params?.id || request.query?.grupo_id;
+
+            // Si es una ruta que depende de un grupo, validamos permiso
+            if (grupoId) {
+                const hasAccess = await checkPermission(user.id, grupoId, requiredPermission);
+                if (!hasAccess) {
+                    reply.code(403);
+                    return buildResponse(403, 'SxGW403', { 
+                        message: `Acceso denegado. Requiere: ${requiredPermission} o ${requiredPermission.split(':')[0]}:manage` 
+                    });
+                }
+            }
+        }
+    } catch (err) {
+        reply.code(500);
+        return buildResponse(500, 'SxGW500', { message: 'Error interno de seguridad' });
+    }
 });
 
-// Rutas del Gateway (Puntos de entrada públicos)
-fastify.post('/auth/register', async (request, reply) => {
-    const res = await fastify.inject({
-        method: 'POST',
-        url: '/users-service/auth/register',
-        payload: request.body
+// --- RUTAS PÚBLICAS DEL GATEWAY ---
+
+// AUTH
+fastify.post('/auth/register', async (req, res) => {
+    const result = await fastify.inject({ method: 'POST', url: '/users-service/auth/register', payload: req.body });
+    res.code(result.statusCode).send(result.json());
+});
+
+fastify.post('/auth/login', async (req, res) => {
+    const result = await fastify.inject({ method: 'POST', url: '/users-service/auth/login', payload: req.body });
+    res.code(result.statusCode).send(result.json());
+});
+
+// USERS
+fastify.get('/users', async (req, res) => {
+    const result = await fastify.inject({ method: 'GET', url: '/users-service/users', headers: req.headers });
+    res.code(result.statusCode).send(result.json());
+});
+
+// GROUPS (Simplificado con un loop o inyecciones directas)
+const groupRoutes = [
+    { method: 'GET', path: '/groups/all', target: '/groups-service/groups/all' },
+    { method: 'POST', path: '/groups/create', target: '/groups-service/groups/create' },
+    { method: 'PATCH', path: '/groups/edit/:id', target: '/groups-service/groups/edit/' },
+    { method: 'DELETE', path: '/groups/delete/:id', target: '/groups-service/groups/delete/' },
+    { method: 'POST', path: '/groups/permissions', target: '/groups-service/groups/permissions' }
+];
+
+groupRoutes.forEach(route => {
+    fastify[route.method.toLowerCase()](route.path, async (req, res) => {
+        const url = route.path.includes(':id') ? route.target + req.params.id : route.target;
+        const payload = req.body ? JSON.stringify(req.body) : null;
+        const result = await fastify.inject({
+            method: route.method,
+            url: url,
+            headers: { ...req.headers, 'content-length': payload ? Buffer.byteLength(payload).toString() : undefined },
+            payload
+        });
+        res.code(result.statusCode).send(result.json());
     });
-    reply.code(res.statusCode).send(res.json());
 });
 
-fastify.post('/auth/login', async (request, reply) => {
-     const res = await fastify.inject({
-        method: 'POST',
-        url: '/users-service/auth/login',
-        payload: request.body
+// TICKETS (Misma lógica de inyección)
+const ticketRoutes = [
+    { method: 'POST', path: '/tickets/create', target: '/tickets-service/tickets/create' },
+    { method: 'PATCH', path: '/tickets/edit/:id', target: '/tickets-service/tickets/edit/' },
+    { method: 'PATCH', path: '/tickets/status/:id', target: '/tickets-service/tickets/status/' },
+    { method: 'DELETE', path: '/tickets/delete/:id', target: '/tickets-service/tickets/delete/' },
+    { method: 'POST', path: '/tickets/comment', target: '/tickets-service/tickets/comment' },
+    { method: 'GET', path: '/tickets/group/:grupo_id', target: '/tickets-service/tickets/group/' }
+];
+
+ticketRoutes.forEach(route => {
+    fastify[route.method.toLowerCase()](route.path, async (req, res) => {
+        const id = req.params.id || req.params.grupo_id;
+        const url = id ? route.target + id : route.target;
+        const payload = req.body ? JSON.stringify(req.body) : null;
+        const result = await fastify.inject({
+            method: route.method,
+            url: url,
+            headers: { ...req.headers, 'content-length': payload ? Buffer.byteLength(payload).toString() : undefined },
+            payload
+        });
+        res.code(result.statusCode).send(result.json());
     });
-    reply.code(res.statusCode).send(res.json());
 });
 
-// --- RUTAS DE GRUPOS EN EL GATEWAY ---
-// Listar grupos (GET) - URL: /groups/all
-fastify.get('/groups/all', async (request, reply) => {
-    const res = await fastify.inject({
-        method: 'GET',
-        url: '/groups-service/groups/all', // Apunta a la nueva ruta /all
-        headers: request.headers
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Crear grupo (POST) - URL: /groups/create
-fastify.post('/groups/create', async (request, reply) => {
-    const payload = JSON.stringify(request.body);
-    const res = await fastify.inject({
-        method: 'POST',
-        url: '/groups-service/groups/create', // Apunta a /create
-        headers: { ...request.headers, 'content-length': Buffer.byteLength(payload).toString() },
-        payload
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Editar grupo (PATCH) - URL: /groups/edit/:id
-fastify.patch('/groups/edit/:id', async (request, reply) => {
-    const payload = JSON.stringify(request.body);
-    const res = await fastify.inject({
-        method: 'PATCH',
-        url: `/groups-service/groups/edit/${request.params.id}`, // Apunta a /edit/id
-        headers: { ...request.headers, 'content-length': Buffer.byteLength(payload).toString() },
-        payload
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Eliminar grupo (DELETE) - URL: /groups/delete/:id
-fastify.delete('/groups/delete/:id', async (request, reply) => {
-    const res = await fastify.inject({
-        method: 'DELETE',
-        url: `/groups-service/groups/delete/${request.params.id}`, // Apunta a /delete/id
-        headers: request.headers
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Asignar Permisos (POST)
-fastify.post('/groups/permissions', async (request, reply) => {
-    const payload = JSON.stringify(request.body);
-    const res = await fastify.inject({
-        method: 'POST',
-        url: '/groups-service/groups/permissions',
-        headers: { ...request.headers, 'content-length': Buffer.byteLength(payload).toString() },
-        payload
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// --- RUTAS DE TICKETS EN EL GATEWAY ---
-// Crear Ticket
-fastify.post('/tickets/create', async (request, reply) => {
-    const payload = JSON.stringify(request.body);
-    const res = await fastify.inject({
-        method: 'POST',
-        url: '/tickets-service/tickets/create',
-        headers: { ...request.headers, 'content-length': Buffer.byteLength(payload).toString() },
-        payload
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Editar Ticket (PATCH)
-fastify.patch('/tickets/edit/:id', async (request, reply) => {
-    const payload = JSON.stringify(request.body);
-    const res = await fastify.inject({
-        method: 'PATCH',
-        url: `/tickets-service/tickets/edit/${request.params.id}`,
-        headers: { ...request.headers, 'content-length': Buffer.byteLength(payload).toString() },
-        payload
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Cambiar Estado (PATCH)
-fastify.patch('/tickets/status/:id', async (request, reply) => {
-    const payload = JSON.stringify(request.body);
-    const res = await fastify.inject({
-        method: 'PATCH',
-        url: `/tickets-service/tickets/status/${request.params.id}`,
-        headers: { 
-            ...request.headers, 
-            'content-length': Buffer.byteLength(payload).toString() 
-        },
-        payload
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Eliminar Ticket (DELETE)
-fastify.delete('/tickets/delete/:id', async (request, reply) => {
-    const res = await fastify.inject({
-        method: 'DELETE',
-        url: `/tickets-service/tickets/delete/${request.params.id}`,
-        headers: request.headers
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Agregar Comentario (POST)
-fastify.post('/tickets/comment', async (request, reply) => {
-    const payload = JSON.stringify(request.body);
-    const res = await fastify.inject({
-        method: 'POST',
-        url: '/tickets-service/tickets/comment',
-        headers: { ...request.headers, 'content-length': Buffer.byteLength(payload).toString() },
-        payload
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Ver Tickets de un grupo
-fastify.get('/tickets/group/:grupo_id', async (request, reply) => {
-    const res = await fastify.inject({
-        method: 'GET',
-        url: `/tickets-service/tickets/group/${request.params.grupo_id}`,
-        headers: request.headers
-    });
-    reply.code(res.statusCode).send(res.json());
-});
-
-// Ruta Protegida de Prueba
-fastify.get('/profile-test', async (request, reply) => {
-  return buildResponse(200, 'SxGW200', { 
-      message: '¡El Gateway verificó tu token con Supabase exitosamente!',
-      userId: request.user.id
-  });
-});
-
-// Levantar el Gateway
+// --- INICIO ---
 const start = async () => {
-  try {
-    await fastify.listen({ port: process.env.PORT || 3000 });
-    console.log(`API Gateway corriendo en el puerto ${process.env.PORT || 3000}`);
-  } catch (err) {
-    fastify.log.error(err);
-    process.exit(1);
-  }
+    try {
+        await fastify.listen({ port: process.env.PORT || 3000 });
+        console.log(`API Gateway RBAC activo en puerto 3000`);
+    } catch (err) {
+        process.exit(1);
+    }
 };
-
 start();
