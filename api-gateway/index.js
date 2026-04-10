@@ -1,204 +1,302 @@
-// RP_Backend/api-gateway/index.js
 require('dotenv').config();
 const fastify = require('fastify')({ logger: true });
-const proxy = require('@fastify/http-proxy');
+const jwt = require('jsonwebtoken');
+const fetch = globalThis.fetch;
 const { createClient } = require('@supabase/supabase-js');
 const { buildResponse } = require('../shared/responseHandler');
 
+const JWT_SECRET = process.env.JWT_SECRET;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
-// --- CONFIGURACIÓN DE CORS ---
-// Esto permite que Angular (puerto 4200) hable con el Gateway (puerto 3000)
+const SERVICES = {
+    users:   'http://localhost:3001',
+    groups:  'http://localhost:3002',
+    tickets: 'http://localhost:3003'
+};
+
+// -------------------------------------------------------
+// CORS
+// -------------------------------------------------------
 fastify.register(require('@fastify/cors'), {
-    origin: true, // En desarrollo permite cualquier origen. En producción usa 'http://localhost:4200'
+    origin: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 });
 
-// --- RATE LIMITING ---
+// -------------------------------------------------------
+// RATE LIMITING
+// -------------------------------------------------------
 fastify.register(require('@fastify/rate-limit'), {
     max: 100,
     timeWindow: '1 minute',
-    errorResponseBuilder: (request, context) => buildResponse(429, 'SxGW429', { message: 'Too many requests' })
+    errorResponseBuilder: () => buildResponse(429, 'SxGW429', {
+        message: 'Demasiadas solicitudes. Intenta de nuevo en un momento.'
+    })
 });
 
-// --- PROXIES ---
-fastify.register(proxy, { upstream: 'http://localhost:3001', prefix: '/users-service', rewritePrefix: '' });
-fastify.register(proxy, { upstream: 'http://localhost:3002', prefix: '/groups-service', rewritePrefix: '' });
-fastify.register(proxy, { upstream: 'http://localhost:3003', prefix: '/tickets-service', rewritePrefix: '' });
-
-// --- LÓGICA DE SEGURIDAD: VERIFICACIÓN DE PERMISOS ---
-async function checkPermission(userId, grupoId, permisoRequerido) {
-    if (!grupoId || !permisoRequerido) return true;
-
-    const modulo = permisoRequerido.split(':')[0];
-    const permisoManage = `${modulo}:manage`;
-
-    const { data, error } = await supabase
-        .from('grupo_usuario_permisos')
-        .select(`
-            permisos!inner (
-                nombre
-            )
-        `)
-        .eq('usuario_id', userId)
-        .eq('grupo_id', grupoId)
-        .or(`nombre.eq.${permisoRequerido},nombre.eq.${permisoManage}`);
-
-    return data && data.length > 0;
+// -------------------------------------------------------
+// HELPER — verificar JWT
+// -------------------------------------------------------
+function verificarToken(authHeader) {
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
+    try {
+        return jwt.verify(authHeader.split(' ')[1], JWT_SECRET);
+    } catch {
+        return null;
+    }
 }
 
-// --- HOOK DE SEGURIDAD (PRE-HANDLER) ---
-fastify.addHook('preHandler', async (request, reply) => {
-    const isAuthRoute = request.url.includes('/auth/login') || request.url.includes('/auth/register') || request.url.includes('/auth/recover');
-    if (isAuthRoute) return;
-
-    const authHeader = request.headers.authorization;
-    if (!authHeader) {
-        reply.code(401);
-        return buildResponse(401, 'SxGW401', { message: 'Token no proporcionado' });
+// -------------------------------------------------------
+// HELPER — verificar permiso en BD
+// El usuario puede tener el permiso ligado a CUALQUIER grupo.
+// Para rutas que no necesitan grupo específico (group:manage, user:manage),
+// basta con que tenga ese permiso en al menos un grupo.
+// -------------------------------------------------------
+function tienePermiso(usuario, grupo_id, permiso_requerido) {
+    const permisosPorGrupo = usuario.permisos || {};
+    
+    if (grupo_id) {
+        // Verificar solo en el grupo específico
+        const permisosGrupo = permisosPorGrupo[String(grupo_id)] || [];
+        return permisosGrupo.includes(permiso_requerido);
+    } else {
+        // Sin grupo específico: verificar en CUALQUIER grupo
+        return Object.values(permisosPorGrupo).some(permisos =>
+            permisos.includes(permiso_requerido)
+        );
     }
+}
 
-    const token = authHeader.split(' ')[1];
-
+// -------------------------------------------------------
+// HELPER — proxy hacia microservicio
+// -------------------------------------------------------
+async function proxyRequest(reply, serviceUrl, path, request) {
     try {
-        const { data: { user }, error: authError } = await supabase.auth.getUser(token);
-        if (authError || !user) {
-            reply.code(403);
-            return buildResponse(403, 'SxGW403', { message: 'Token inválido o expirado' });
+        const url = `${serviceUrl}${path}`;
+        const headers = { 'Authorization': request.headers.authorization || '' };
+
+        const options = { method: request.method, headers };
+
+        // Solo añadir Content-Type y Body si hay datos reales
+        if (['POST', 'PATCH', 'PUT', 'DELETE'].includes(request.method) && request.body && Object.keys(request.body).length > 0) {
+            headers['Content-Type'] = 'application/json';
+            options.body = JSON.stringify(request.body);
         }
-        request.user = user;
 
-        const permissionsMatrix = {
-            '/tickets/create': 'ticket:add',
-            '/tickets/edit': 'ticket:edit',
-            '/tickets/status': 'ticket:edit:state',
-            '/tickets/comment': 'ticket:edit:comment',
-            '/tickets/delete': 'ticket:delete',
-            '/tickets/group': 'ticket:view',
-            '/groups/all': 'group:view',
-            '/groups/edit': 'group:edit',
-            '/groups/delete': 'group:delete',
-            '/groups/permissions': 'group:manage',
-            '/users': 'user:view'
-        };
-
-        const matchedRoute = Object.keys(permissionsMatrix).find(route => request.url.includes(route));
-
-        if (matchedRoute) {
-            const requiredPermission = permissionsMatrix[matchedRoute];
-            const grupoId = request.body?.grupo_id || request.params?.grupo_id || request.params?.id || request.query?.grupo_id;
-
-            if (grupoId) {
-                const hasAccess = await checkPermission(user.id, grupoId, requiredPermission);
-                if (!hasAccess) {
-                    reply.code(403);
-                    return buildResponse(403, 'SxGW403', { 
-                        message: `Acceso denegado. Requiere: ${requiredPermission} o ${requiredPermission.split(':')[0]}:manage` 
-                    });
-                }
-            }
-        }
+        const response = await fetch(url, options);
+        const data = await response.json();
+        reply.code(response.status).send(data);
     } catch (err) {
-        reply.code(500);
-        return buildResponse(500, 'SxGW500', { message: 'Error interno de seguridad' });
+        reply.code(502).send(buildResponse(502, 'SxGW502', { message: 'Servicio no disponible.' }));
+    }
+}
+
+// -------------------------------------------------------
+// MATRIZ DE PERMISOS POR ENDPOINT
+// -------------------------------------------------------
+const PERMISOS_REQUERIDOS = {
+    'POST /tickets':                          { permiso: 'ticket:add',       necesitaGrupo: true  },
+    'PATCH /tickets/:id':                     { permiso: 'ticket:edit',      necesitaGrupo: true  },
+    'PATCH /tickets/:id/status':              { permiso: 'ticket:edit:state',necesitaGrupo: true  },
+    'DELETE /tickets/:id':                    { permiso: 'ticket:delete',    necesitaGrupo: true  },
+    'POST /groups':                           { permiso: 'group:manage',     necesitaGrupo: false },
+    'PATCH /groups/:id':                      { permiso: 'group:manage',     necesitaGrupo: false },
+    'DELETE /groups/:id':                     { permiso: 'group:manage',     necesitaGrupo: false },
+    'POST /groups/:id/members':               { permiso: 'group:manage',     necesitaGrupo: false },
+    'DELETE /groups/:id/members/:usuario_id': { permiso: 'group:manage',     necesitaGrupo: false },
+    'POST /groups/:id/permissions':           { permiso: 'user:manage',      necesitaGrupo: false },
+    'DELETE /groups/:id/permissions':         { permiso: 'user:manage',      necesitaGrupo: false },
+    'GET /users':                             { permiso: 'user:manage',      necesitaGrupo: false },
+    'DELETE /users/:id':                      { permiso: 'user:manage',      necesitaGrupo: false },
+    'GET /users/:id/groups':                  { permiso: 'user:manage', necesitaGrupo: false },
+};
+
+// -------------------------------------------------------
+// HELPER — normalizar URL comparando contra patrones conocidos
+// Evita el problema de reemplazar TODOS los segmentos por /:id
+// y perder los nombres reales como /:usuario_id
+// -------------------------------------------------------
+function normalizarUrl(url) {
+    return url
+        .split('?')[0]
+        .replace(/\/\d+\/members\/\d+/g, '/:id/members/:usuario_id')
+        .replace(/\/\d+\/permissions\/\d+/g, '/:id/permissions/:usuario_id')
+        .replace(/\/\d+\/permissions/g, '/:id/permissions')
+        .replace(/\/\d+\/members/g, '/:id/members')
+        .replace(/\/\d+\/comments\/\d+/g, '/:id/comments/:comentario_id')
+        .replace(/\/\d+\/comments/g, '/:id/comments')
+        .replace(/\/\d+\/status/g, '/:id/status')
+        .replace(/\/\d+/g, '/:id');
+}
+
+// -------------------------------------------------------
+// HOOK PRINCIPAL DE SEGURIDAD
+// -------------------------------------------------------
+fastify.addHook('preHandler', async (request, reply) => {
+    const rutasPublicas = ['/auth/login', '/auth/register', '/health'];
+    if (rutasPublicas.some(r => request.url.startsWith(r))) return;
+
+    const usuario = verificarToken(request.headers.authorization);
+    if (!usuario) {
+        reply.code(401);
+        return reply.send(buildResponse(401, 'SxGW401', { message: 'Token no proporcionado.' }));
+    }
+
+    request.usuario = usuario;
+
+    const urlNormalizada = normalizarUrl(request.url);
+    const clavePermiso = `${request.method} ${urlNormalizada}`;
+    const reglaPermiso = PERMISOS_REQUERIDOS[clavePermiso];
+
+    if (reglaPermiso) {
+        const grupo_id = reglaPermiso.necesitaGrupo
+            ? (request.body?.grupo_id || request.params?.grupo_id || request.query?.grupo_id || null)
+            : null;
+
+        const tiene = tienePermiso(usuario, grupo_id, reglaPermiso.permiso);
+
+        if (!tiene) {
+            reply.code(403);
+            return reply.send(buildResponse(403, 'SxGW403', {
+                message: `Acceso denegado. Se requiere: ${reglaPermiso.permiso}`
+            }));
+        }
     }
 });
 
-// --- RUTAS PÚBLICAS DEL GATEWAY ---
-fastify.post('/auth/register', async (req, res) => {
-    const result = await fastify.inject({ 
-        method: 'POST', 
-        url: '/users-service/auth/register', 
-        payload: req.body 
-    });
-    // USAMOS .payload (que ya es string) y lo parseamos o enviamos directo
-    res.code(result.statusCode).send(result.payload);
+// -------------------------------------------------------
+// RUTAS PÚBLICAS
+// -------------------------------------------------------
+fastify.get('/health', async (request, reply) => {
+    return buildResponse(200, 'SxGW200', { message: 'API Gateway funcionando correctamente.' });
 });
 
-fastify.post('/auth/login', async (req, res) => {
-    const result = await fastify.inject({ 
-        method: 'POST', 
-        url: '/users-service/auth/login', 
-        payload: req.body 
-    });
-    res.code(result.statusCode).send(result.payload);
+fastify.post('/auth/register', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, '/auth/register', request);
 });
 
-fastify.post('/auth/recover', async (request, reply) => {
-    const res = await fastify.inject({ method: 'POST', url: '/users-service/auth/recover', payload: request.body });
-    reply.code(res.statusCode).send(res.json());
+fastify.post('/auth/login', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, '/auth/login', request);
 });
 
-fastify.patch('/auth/update-password', async (request, reply) => {
-    const payload = JSON.stringify(request.body);
-    const res = await fastify.inject({
-        method: 'PATCH',
-        url: '/users-service/auth/update-password',
-        headers: { ...request.headers, 'content-length': Buffer.byteLength(payload).toString() },
-        payload
-    });
-    reply.code(res.statusCode).send(res.json());
+// -------------------------------------------------------
+// RUTAS DE USUARIOS
+// -------------------------------------------------------
+fastify.get('/users', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, '/users', request);
 });
 
-fastify.get('/users', async (req, res) => {
-    const result = await fastify.inject({ method: 'GET', url: '/users-service/users', headers: req.headers });
-    res.code(result.statusCode).send(result.json());
+fastify.get('/users/:usuario_id/groups', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/users/${request.params.usuario_id}/groups`, request);
 });
 
-// Dinámica de Grupos y Tickets...
-const groupRoutes = [
-    { method: 'GET', path: '/groups/all', target: '/groups-service/groups/all' },
-    { method: 'POST', path: '/groups/create', target: '/groups-service/groups/create' },
-    { method: 'PATCH', path: '/groups/edit/:id', target: '/groups-service/groups/edit/' },
-    { method: 'DELETE', path: '/groups/delete/:id', target: '/groups-service/groups/delete/' },
-    { method: 'POST', path: '/groups/permissions', target: '/groups-service/groups/permissions' }
-];
-
-groupRoutes.forEach(route => {
-    fastify[route.method.toLowerCase()](route.path, async (req, res) => {
-        const url = route.path.includes(':id') ? route.target + req.params.id : route.target;
-        const payload = req.body ? JSON.stringify(req.body) : null;
-        const result = await fastify.inject({
-            method: route.method,
-            url: url,
-            headers: { ...req.headers, 'content-length': payload ? Buffer.byteLength(payload).toString() : undefined },
-            payload
-        });
-        res.code(result.statusCode).send(result.json());
-    });
+fastify.get('/users/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, `/users/${request.params.id}`, request);
 });
 
-const ticketRoutes = [
-    { method: 'POST', path: '/tickets/create', target: '/tickets-service/tickets/create' },
-    { method: 'PATCH', path: '/tickets/edit/:id', target: '/tickets-service/tickets/edit/' },
-    { method: 'PATCH', path: '/tickets/status/:id', target: '/tickets-service/tickets/status/' },
-    { method: 'DELETE', path: '/tickets/delete/:id', target: '/tickets-service/tickets/delete/' },
-    { method: 'POST', path: '/tickets/comment', target: '/tickets-service/tickets/comment' },
-    { method: 'GET', path: '/tickets/group/:grupo_id', target: '/tickets-service/tickets/group/' }
-];
-
-ticketRoutes.forEach(route => {
-    fastify[route.method.toLowerCase()](route.path, async (req, res) => {
-        const id = req.params.id || req.params.grupo_id;
-        const url = id ? route.target + id : route.target;
-        const payload = req.body ? JSON.stringify(req.body) : null;
-        const result = await fastify.inject({
-            method: route.method,
-            url: url,
-            headers: { ...req.headers, 'content-length': payload ? Buffer.byteLength(payload).toString() : undefined },
-            payload
-        });
-        res.code(result.statusCode).send(result.json());
-    });
+fastify.patch('/users/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, `/users/${request.params.id}`, request);
 });
 
+fastify.delete('/users/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, `/users/${request.params.id}`, request);
+});
+
+// -------------------------------------------------------
+// RUTAS DE GRUPOS
+// -------------------------------------------------------
+fastify.get('/groups', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, '/groups', request);
+});
+
+fastify.get('/groups/all', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, '/groups/all', request);
+});
+
+fastify.get('/groups/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/groups/${request.params.id}`, request);
+});
+
+fastify.post('/groups', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, '/groups', request);
+});
+
+fastify.patch('/groups/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/groups/${request.params.id}`, request);
+});
+
+fastify.delete('/groups/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/groups/${request.params.id}`, request);
+});
+
+fastify.post('/groups/:id/members', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/groups/${request.params.id}/members`, request);
+});
+
+fastify.delete('/groups/:id/members/:usuario_id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/groups/${request.params.id}/members/${request.params.usuario_id}`, request);
+});
+
+fastify.post('/groups/:id/permissions', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/groups/${request.params.id}/permissions`, request);
+});
+
+fastify.delete('/groups/:id/permissions', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/groups/${request.params.id}/permissions`, request);
+});
+
+fastify.get('/groups/:id/permissions/:usuario_id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, `/groups/${request.params.id}/permissions/${request.params.usuario_id}`, request);
+});
+
+// -------------------------------------------------------
+// RUTAS DE TICKETS
+// -------------------------------------------------------
+fastify.get('/tickets/group/:grupo_id', async (request, reply) => {
+    const query = new URLSearchParams(request.query).toString();
+    const path = `/tickets/group/${request.params.grupo_id}${query ? '?' + query : ''}`;
+    await proxyRequest(reply, SERVICES.tickets, path, request);
+});
+
+fastify.get('/tickets/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.tickets, `/tickets/${request.params.id}`, request);
+});
+
+fastify.post('/tickets', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.tickets, '/tickets', request);
+});
+
+fastify.patch('/tickets/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.tickets, `/tickets/${request.params.id}`, request);
+});
+
+fastify.patch('/tickets/:id/status', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.tickets, `/tickets/${request.params.id}/status`, request);
+});
+
+fastify.delete('/tickets/:id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.tickets, `/tickets/${request.params.id}`, request);
+});
+
+fastify.post('/tickets/:id/comments', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.tickets, `/tickets/${request.params.id}/comments`, request);
+});
+
+fastify.delete('/tickets/:id/comments/:comentario_id', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.tickets, `/tickets/${request.params.id}/comments/${request.params.comentario_id}`, request);
+});
+
+// -------------------------------------------------------
+// START
+// -------------------------------------------------------
 const start = async () => {
     try {
-        await fastify.listen({ port: process.env.PORT || 3000 });
-        console.log(`API Gateway RBAC activo en puerto 3000`);
+        await fastify.listen({ port: process.env.PORT || 3000, host: '0.0.0.0' });
+        console.log(`API Gateway activo en puerto ${process.env.PORT || 3000}`);
     } catch (err) {
+        console.error(err);
         process.exit(1);
     }
 };
+
 start();

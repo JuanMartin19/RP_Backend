@@ -1,182 +1,320 @@
 // RP_Backend/service-users/server.js
 require('dotenv').config();
 const fastify = require('fastify')({ logger: true });
-const supabase = require('./supabaseClient');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const { supabase } = require('./supabaseClient');
 const { buildResponse } = require('../shared/responseHandler');
 
-// --- RUTA DE PRUEBA ---
+const JWT_SECRET = process.env.JWT_SECRET;
+const SALT_ROUNDS = 10;
+
+// --- CORS ---
+fastify.register(require('@fastify/cors'), { origin: true });
+
+// -------------------------------------------------------
+// HEALTH CHECK
+// -------------------------------------------------------
 fastify.get('/health', async (request, reply) => {
-  return buildResponse(200, 'SxUS200', { message: 'Servicio de usuarios funcionando correctamente' });
+    return buildResponse(200, 'SxUS200', { 
+        message: 'Servicio de usuarios funcionando correctamente' 
+    });
 });
 
-// --- RUTA DE REGISTRO ---
+// -------------------------------------------------------
+// REGISTER
+// -------------------------------------------------------
 fastify.post('/auth/register', async (request, reply) => {
-  // 1. Recibimos los datos del frontend (o de Postman)
-  const { nombre_completo, username, email, password } = request.body;
+    const { nombre_completo, username, email, password, direccion, telefono } = request.body;
 
-  // 2. Validamos que no falte nada [cite: 157]
-  if (!email || !password || !nombre_completo || !username) {
-    reply.code(400); // 400 Bad Request
-    return buildResponse(400, 'SxUS400', { message: 'Faltan campos obligatorios' });
-  }
-
-  try {
-    // 3. Registramos la contraseña en Supabase Auth (el sistema seguro)
-    const { data: authData, error: authError } = await supabase.auth.signUp({
-      email: email,
-      password: password,
-    });
-
-    if (authError) {
-      reply.code(400);
-      return buildResponse(400, 'SxUS400', { message: authError.message });
+    // 1. Validar campos obligatorios
+    if (!nombre_completo || !username || !email || !password) {
+        reply.code(400);
+        return buildResponse(400, 'SxUS400', { 
+            message: 'nombre_completo, username, email y password son obligatorios.' 
+        });
     }
 
-    // 4. Guardamos los datos del perfil en tu tabla 'usuarios'
-    // Usamos el mismo ID que nos generó Supabase Auth para mantenerlos vinculados
-    const { data: userData, error: userError } = await supabase
-      .from('usuarios')
-      .insert([
-        {
-          id: authData.user.id,
-          nombre_completo: nombre_completo,
-          username: username,
-          email: email
+    // 2. Validar formato de email
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        reply.code(400);
+        return buildResponse(400, 'SxUS400', { message: 'Formato de email inválido.' });
+    }
+
+    // 3. Validar longitud de password
+    if (password.length < 6) {
+        reply.code(400);
+        return buildResponse(400, 'SxUS400', { 
+            message: 'La contraseña debe tener al menos 6 caracteres.' 
+        });
+    }
+
+    try {
+        // 4. Verificar si email o username ya existen
+        const { data: existingUser } = await supabase
+            .from('usuarios')
+            .select('username, email')
+            .or(`email.eq.${email},username.eq.${username}`)
+            .maybeSingle();
+
+        if (existingUser) {
+            reply.code(400);
+            if (existingUser.email === email) {
+                return buildResponse(400, 'SxUS400', { message: 'El correo ya está registrado.' });
+            }
+            if (existingUser.username === username) {
+                return buildResponse(400, 'SxUS400', { message: 'El nombre de usuario no está disponible.' });
+            }
         }
-      ])
-      .select();
 
-    if (userError) {
-      reply.code(500);
-      return buildResponse(500, 'SxUS500', { message: 'Error al guardar perfil', error: userError.message });
+        // 5. Hashear password
+        const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
+
+        // 6. Insertar usuario
+        const { data: newUser, error: insertError } = await supabase
+            .from('usuarios')
+            .insert([{
+                nombre_completo,
+                username,
+                email,
+                password: hashedPassword,
+                direccion: direccion || null,
+                telefono: telefono || null
+            }])
+            .select('id, nombre_completo, username, email, creado_en')
+            .single();
+
+        if (insertError) {
+            console.error('Error al insertar usuario:', insertError.message);
+            reply.code(500);
+            return buildResponse(500, 'SxUS500', { message: 'Error al crear el usuario.' });
+        }
+
+        reply.code(201);
+        return buildResponse(201, 'SxUS201', { 
+            message: '¡Registro exitoso!',
+            user: newUser
+        });
+
+    } catch (err) {
+        console.error('FATAL register:', err.message);
+        reply.code(500);
+        return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
     }
-
-    // 5. ¡Éxito! Devolvemos la respuesta universal
-    reply.code(201); // 201 Created
-    return buildResponse(201, 'SxUS201', { 
-      message: 'Usuario registrado exitosamente', 
-      user: userData[0] 
-    });
-
-  } catch (err) {
-    reply.code(500);
-    return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor' });
-  }
 });
 
-// --- RUTA DE LOGIN ---
+// -------------------------------------------------------
+// LOGIN
+// -------------------------------------------------------
 fastify.post('/auth/login', async (request, reply) => {
-  const { email, password } = request.body;
+    const { email, password } = request.body;
 
-  if (!email || !password) {
-    reply.code(400);
-    return buildResponse(400, 'SxUS400', { message: 'Faltan credenciales' });
-  }
-
-  try {
-    // 1. Autenticar con Supabase (esto verifica si el correo y la contraseña coinciden)
-    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
-      email: email,
-      password: password,
-    });
-
-    if (authError) {
-      reply.code(401); // 401 Unauthorized
-      return buildResponse(401, 'SxUS401', { message: 'Credenciales inválidas' });
+    // 1. Validar campos obligatorios
+    if (!email || !password) {
+        reply.code(400);
+        return buildResponse(400, 'SxUS400', { 
+            message: 'Email y password son obligatorios.' 
+        });
     }
 
-    // 2. Traer los datos del perfil desde tu tabla 'usuarios'
-    const { data: userData, error: userError } = await supabase
-      .from('usuarios')
-      .select('*')
-      .eq('id', authData.user.id)
-      .single(); // Esperamos un solo resultado
+    try {
+        // 2. Buscar usuario por email
+        const { data: usuario, error } = await supabase
+            .from('usuarios')
+            .select('*')
+            .eq('email', email)
+            .maybeSingle();
 
-    if (userError) {
-      reply.code(500);
-      return buildResponse(500, 'SxUS500', { message: 'Error al obtener el perfil del usuario' });
+        if (error || !usuario) {
+            reply.code(401);
+            return buildResponse(401, 'SxUS401', { message: 'Credenciales incorrectas.' });
+        }
+
+        // 3. Verificar password
+        const passwordValido = await bcrypt.compare(password, usuario.password);
+        if (!passwordValido) {
+            reply.code(401);
+            return buildResponse(401, 'SxUS401', { message: 'Credenciales incorrectas.' });
+        }
+
+        // 4. Traer permisos del usuario por grupo
+        const { data: permisosData } = await supabase
+            .from('grupo_usuario_permisos')
+            .select(`
+                grupo_id,
+                permisos ( nombre )
+            `)
+            .eq('usuario_id', usuario.id);
+
+        // Agrupar permisos por grupo: { "1": ["tickets:add", "tickets:move"], "2": [...] }
+        const permisosPorGrupo = {};
+        if (permisosData) {
+            permisosData.forEach(({ grupo_id, permisos }) => {
+                if (!permisosPorGrupo[grupo_id]) permisosPorGrupo[grupo_id] = [];
+                permisosPorGrupo[grupo_id].push(permisos.nombre);
+            });
+        }
+
+        // 5. Generar JWT
+        const payload = {
+            sub: usuario.id,
+            username: usuario.username,
+            email: usuario.email,
+            permisos: permisosPorGrupo
+        };
+
+        const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+
+        // 6. Actualizar last_login
+        await supabase
+            .from('usuarios')
+            .update({ last_login: new Date().toISOString() })
+            .eq('id', usuario.id);
+
+        // 7. Responder sin exponer la password
+        const { password: _, ...usuarioSinPassword } = usuario;
+
+        return buildResponse(200, 'SxUS200', {
+            message: 'Acceso correcto.',
+            token,
+            user: usuarioSinPassword
+        });
+
+    } catch (err) {
+        console.error('FATAL login:', err.message);
+        reply.code(500);
+        return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
     }
-
-    // 3. ¡Éxito! Devolvemos el token (JWT) que nos dio Supabase y los datos del usuario
-    reply.code(200);
-    return buildResponse(200, 'SxUS200', {
-      message: 'Login exitoso',
-      token: authData.session.access_token, // Este es el JWT que usará el API Gateway
-      user: userData
-    });
-
-  } catch (err) {
-    reply.code(500);
-    return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor' });
-  }
 });
 
-// --- NUEVO: OBTENER TODOS LOS USUARIOS ---
+// -------------------------------------------------------
+// GET TODOS LOS USUARIOS (requiere token — lo valida el API Gateway)
+// -------------------------------------------------------
 fastify.get('/users', async (request, reply) => {
-  try {
-    // Nota: Por ahora listamos todos. 
-    // Más adelante el API Gateway protegerá esta ruta para que solo entren los que tengan el permiso 'user:view'
-    
-    const { data: users, error } = await supabase
-      .from('usuarios')
-      .select('id, nombre_completo, username, email, fecha_inicio, last_login');
+    try {
+        const { data: users, error } = await supabase
+            .from('usuarios')
+            .select('id, nombre_completo, username, email, telefono, direccion, last_login, creado_en');
 
-    if (error) throw error;
+        if (error) throw error;
 
-    reply.code(200);
-    return buildResponse(200, 'SxUS200', users);
+        return buildResponse(200, 'SxUS200', users);
 
-  } catch (err) {
-    fastify.log.error(err);
-    reply.code(500);
-    return buildResponse(500, 'SxUS500', { message: 'Error al obtener usuarios' });
-  }
+    } catch (err) {
+        console.error('Error GET /users:', err.message);
+        reply.code(500);
+        return buildResponse(500, 'SxUS500', { message: 'Error al obtener usuarios.' });
+    }
 });
 
-// --- NUEVO: EDITAR UN PERFIL DE USUARIO ---
+// -------------------------------------------------------
+// GET USUARIO POR ID
+// -------------------------------------------------------
+fastify.get('/users/:id', async (request, reply) => {
+    const { id } = request.params;
+
+    try {
+        const { data: usuario, error } = await supabase
+            .from('usuarios')
+            .select('id, nombre_completo, username, email, telefono, direccion, last_login, creado_en')
+            .eq('id', id)
+            .maybeSingle();
+
+        if (error || !usuario) {
+            reply.code(404);
+            return buildResponse(404, 'SxUS404', { message: 'Usuario no encontrado.' });
+        }
+
+        return buildResponse(200, 'SxUS200', usuario);
+
+    } catch (err) {
+        console.error('Error GET /users/:id:', err.message);
+        reply.code(500);
+        return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
+    }
+});
+
+// -------------------------------------------------------
+// PATCH USUARIO (actualizar datos básicos)
+// -------------------------------------------------------
 fastify.patch('/users/:id', async (request, reply) => {
-  const userId = request.params.id; // El ID viene en la URL (ej. /users/123)
-  const updates = request.body; // Los campos a actualizar (nombre_completo, telefono, etc.)
+    const { id } = request.params;
+    const body = { ...request.body };
 
-  // Prevenir que intenten cambiar el ID o la contraseña desde aquí
-  delete updates.id;
-  delete updates.password; 
+    // Campos que no se pueden modificar desde aquí
+    delete body.id;
+    delete body.password;
+    delete body.email;
+    delete body.creado_en;
 
-  try {
-    const { data: updatedUser, error } = await supabase
-      .from('usuarios')
-      .update(updates)
-      .eq('id', userId)
-      .select()
-      .single();
-
-    if (error) {
-       reply.code(404); // 404 Not Found si el ID no existe
-       return buildResponse(404, 'SxUS404', { message: 'Usuario no encontrado o sin cambios' });
+    if (Object.keys(body).length === 0) {
+        reply.code(400);
+        return buildResponse(400, 'SxUS400', { message: 'No hay campos válidos para actualizar.' });
     }
 
-    reply.code(200);
-    return buildResponse(200, 'SxUS200', {
-      message: 'Perfil actualizado correctamente',
-      user: updatedUser
-    });
+    try {
+        const { data: updatedUser, error } = await supabase
+            .from('usuarios')
+            .update(body)
+            .eq('id', id)
+            .select('id, nombre_completo, username, email, telefono, direccion, last_login, creado_en')
+            .single();
 
-  } catch (err) {
-    fastify.log.error(err);
-    reply.code(500);
-    return buildResponse(500, 'SxUS500', { message: 'Error interno al actualizar usuario' });
-  }
+        if (error) {
+            reply.code(404);
+            return buildResponse(404, 'SxUS404', { message: 'Usuario no encontrado.' });
+        }
+
+        return buildResponse(200, 'SxUS200', { 
+            message: 'Perfil actualizado correctamente.', 
+            user: updatedUser 
+        });
+
+    } catch (err) {
+        console.error('Error PATCH /users/:id:', err.message);
+        reply.code(500);
+        return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
+    }
 });
 
-// --- LEVANTAR SERVIDOR ---
+// -------------------------------------------------------
+// DELETE USUARIO
+// -------------------------------------------------------
+fastify.delete('/users/:id', async (request, reply) => {
+    const { id } = request.params;
+
+    try {
+        const { error } = await supabase
+            .from('usuarios')
+            .delete()
+            .eq('id', id);
+
+        if (error) {
+            reply.code(404);
+            return buildResponse(404, 'SxUS404', { message: 'Usuario no encontrado.' });
+        }
+
+        return buildResponse(200, 'SxUS200', { message: 'Usuario eliminado correctamente.' });
+
+    } catch (err) {
+        console.error('Error DELETE /users/:id:', err.message);
+        reply.code(500);
+        return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
+    }
+});
+
+// -------------------------------------------------------
+// START
+// -------------------------------------------------------
 const start = async () => {
-  try {
-    await fastify.listen({ port: process.env.PORT || 3001 });
-    console.log(`Servicio de Usuarios corriendo en el puerto ${process.env.PORT || 3001}`);
-  } catch (err) {
-    fastify.log.error(err);
-    process.exit(1);
-  }
+    try {
+        await fastify.listen({ port: process.env.PORT || 3001, host: '0.0.0.0' });
+        console.log(`Servicio de Usuarios activo en puerto ${process.env.PORT || 3001}`);
+    } catch (err) {
+        console.error(err);
+        process.exit(1);
+    }
 };
 
 start();

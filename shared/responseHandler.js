@@ -1,5 +1,4 @@
 // RP_Backend/shared/responseHandler.js
-
 /**
  * Genera el esquema de respuesta universal
  * @param {number} statusCode - Código HTTP (ej. 200, 400, 403)
