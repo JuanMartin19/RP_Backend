@@ -46,6 +46,9 @@ fastify.get('/health', async (request, reply) => {
 // -------------------------------------------------------
 // GET — listar tickets por grupo
 // -------------------------------------------------------
+// -------------------------------------------------------
+// GET — listar tickets por grupo (o todos si grupo_id es 'all')
+// -------------------------------------------------------
 fastify.get('/tickets/group/:grupo_id', async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) {
@@ -54,26 +57,29 @@ fastify.get('/tickets/group/:grupo_id', async (request, reply) => {
     }
 
     const { grupo_id } = request.params;
-
-    // Filtros opcionales por query params: ?estado=Pendiente&prioridad=Alta&asignado_id=5
-    const { estado, prioridad, asignado_id } = request.query;
+    const { asignado_id } = request.query;
+    const { estado, prioridad } = request.query;
 
     try {
         let query = supabase
             .from('tickets')
             .select(`
-                id, titulo, descripcion, estado, prioridad, creado_en,
+                id, titulo, descripcion, estado, prioridad, creado_en, grupo_id,
                 autor:autor_id ( id, nombre_completo, username ),
                 asignado:asignado_id ( id, nombre_completo, username )
-            `)
-            .eq('grupo_id', grupo_id)
-            .order('creado_en', { ascending: false });
+            `);
+
+        if (grupo_id !== 'all') {
+            query = query.eq('grupo_id', grupo_id);
+        }
 
         if (estado) query = query.eq('estado', estado);
         if (prioridad) query = query.eq('prioridad', prioridad);
+        
+        // Filtro fundamental para el Perfil
         if (asignado_id) query = query.eq('asignado_id', asignado_id);
 
-        const { data: tickets, error } = await query;
+        const { data: tickets, error } = await query.order('creado_en', { ascending: false });
 
         if (error) throw error;
 
@@ -102,7 +108,7 @@ fastify.get('/tickets/:id', async (request, reply) => {
         const { data: ticket, error } = await supabase
             .from('tickets')
             .select(`
-                id, titulo, descripcion, estado, prioridad, creado_en,
+                id, grupo_id, titulo, descripcion, estado, prioridad, creado_en, 
                 autor:autor_id ( id, nombre_completo, username ),
                 asignado:asignado_id ( id, nombre_completo, username )
             `)
