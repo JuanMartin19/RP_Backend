@@ -96,20 +96,25 @@ async function proxyRequest(reply, serviceUrl, path, request) {
 // MATRIZ DE PERMISOS POR ENDPOINT
 // -------------------------------------------------------
 const PERMISOS_REQUERIDOS = {
+    // --- TICKETS ---
     'POST /tickets':                          { permiso: 'ticket:add',        necesitaGrupo: true  },
-    'PATCH /tickets/:id':                     { permiso: 'ticket:edit',       necesitaGrupo: true  }, // Esta es la única que debe quedar
+    'PATCH /tickets/:id':                     { permiso: 'ticket:edit',       necesitaGrupo: true  },
     'PATCH /tickets/:id/status':              { permiso: 'ticket:edit:state', necesitaGrupo: true  },
     'DELETE /tickets/:id':                    { permiso: 'ticket:delete',     necesitaGrupo: true  },
+    'POST /tickets/:id/comments':             { permiso: 'ticket:edit:comment', necesitaGrupo: true },
+    'DELETE /tickets/:id/comments/:comentario_id': { permiso: 'ticket:edit:comment', necesitaGrupo: true },
     
-    'GET /groups/all':                        { permiso: 'group:view',    necesitaGrupo: false },
+    // --- GRUPOS ---
+    'GET /groups/all':                        { permiso: 'group:manage',  necesitaGrupo: false },
     'POST /groups':                           { permiso: 'group:add',     necesitaGrupo: false },
-    'PATCH /groups/:id':                      { permiso: 'group:view',    necesitaGrupo: false },
-    'POST /groups/:id/members':               { permiso: 'group:view',    necesitaGrupo: false },
+    'PATCH /groups/:id':                      { permiso: 'group:manage',  necesitaGrupo: false }, // Cambiado de view a manage
+    'POST /groups/:id/members':               { permiso: 'group:manage',  necesitaGrupo: false }, // Cambiado a manage
     'DELETE /groups/:id':                     { permiso: 'group:delete',  necesitaGrupo: false }, 
-    'DELETE /groups/:id/members/:usuario_id': { permiso: 'group:view',    necesitaGrupo: false },
-    'POST /groups/:id/permissions':           { permiso: 'group:view',    necesitaGrupo: false },
-    'DELETE /groups/:id/permissions':         { permiso: 'group:view',    necesitaGrupo: false },
+    'DELETE /groups/:id/members/:usuario_id': { permiso: 'group:manage',  necesitaGrupo: false }, // Cambiado a manage
+    'POST /groups/:id/permissions':           { permiso: 'group:manage',  necesitaGrupo: false }, // Cambiado a manage
+    'DELETE /groups/:id/permissions':         { permiso: 'group:manage',  necesitaGrupo: false }, // Cambiado a manage
     
+    // --- USUARIOS ---
     'GET /users':                             { permiso: 'user:view',     necesitaGrupo: false },
     'DELETE /users/:id':                      { permiso: 'user:manage',   necesitaGrupo: false },
     'GET /users/:id/groups':                  { permiso: 'user:manage',   necesitaGrupo: false },
@@ -225,12 +230,12 @@ fastify.delete('/users/:id', async (request, reply) => {
 // -------------------------------------------------------
 // RUTAS DE GRUPOS
 // -------------------------------------------------------
-fastify.get('/groups', async (request, reply) => {
-    await proxyRequest(reply, SERVICES.groups, '/groups', request);
-});
-
 fastify.get('/groups/all', async (request, reply) => {
     await proxyRequest(reply, SERVICES.groups, '/groups/all', request);
+});
+
+fastify.get('/groups', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.groups, '/groups', request);
 });
 
 fastify.get('/groups/:id', async (request, reply) => {

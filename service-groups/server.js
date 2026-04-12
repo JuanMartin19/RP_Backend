@@ -1,3 +1,4 @@
+// RP_Backend/service-groups/server.js
 require('dotenv').config();
 const fastify = require('fastify')({ logger: true });
 const jwt = require('jsonwebtoken');
@@ -8,6 +9,64 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
 const JWT_SECRET = process.env.JWT_SECRET;
 
 fastify.register(require('@fastify/cors'), { origin: true });
+
+// =======================================================
+// SCHEMAS DE VALIDACIÓN (AJV nativo de Fastify)
+// =======================================================
+
+const createGroupSchema = {
+    body: {
+        type: 'object',
+        required: ['nombre'],
+        properties: {
+            nombre: { type: 'string', minLength: 3 },
+            descripcion: { type: ['string', 'null'] }
+        }
+    }
+};
+
+const updateGroupSchema = {
+    body: {
+        type: 'object',
+        properties: {
+            nombre: { type: 'string', minLength: 3 },
+            descripcion: { type: ['string', 'null'] }
+        }
+    }
+};
+
+const addMemberSchema = {
+    body: {
+        type: 'object',
+        required: ['usuario_id'],
+        properties: {
+            usuario_id: { type: 'integer' }
+        }
+    }
+};
+
+const permissionSchema = {
+    body: {
+        type: 'object',
+        required: ['usuario_id', 'permiso_nombre'],
+        properties: {
+            usuario_id: { type: 'integer' },
+            permiso_nombre: { type: 'string', minLength: 3 }
+        }
+    }
+};
+
+// Interceptor global para errores de validación de JSON Schema
+fastify.setErrorHandler(function (error, request, reply) {
+    if (error.validation) {
+        reply.code(400).send(buildResponse(400, 'SxGR400', {
+            message: `Error de validación: ${error.message}`
+        }));
+    } else {
+        reply.send(error);
+    }
+});
+
 
 // -------------------------------------------------------
 // HELPER — verificar token JWT
@@ -143,21 +202,16 @@ fastify.get('/groups/:id', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// POST — crear grupo
+// POST — crear grupo (con Schema)
 // -------------------------------------------------------
-fastify.post('/groups', async (request, reply) => {
+fastify.post('/groups', { schema: createGroupSchema }, async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) {
         reply.code(401);
         return buildResponse(401, 'SxGR401', { message: 'Token inválido o expirado.' });
     }
 
-    const { nombre, descripcion } = request.body || {};
-
-    if (!nombre) {
-        reply.code(400);
-        return buildResponse(400, 'SxGR400', { message: 'El nombre del grupo es obligatorio.' });
-    }
+    const { nombre, descripcion } = request.body;
 
     try {
         const { data: nuevoGrupo, error: groupError } = await supabase
@@ -191,26 +245,30 @@ fastify.post('/groups', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// PATCH — editar grupo
+// PATCH — editar grupo (con Schema)
 // -------------------------------------------------------
-// RP_Backend/service-groups/server.js
-
-fastify.patch('/groups/:id', async (request, reply) => {
+fastify.patch('/groups/:id', { schema: updateGroupSchema }, async (request, reply) => {
     const usuario = verificarToken(request);
     const { id } = request.params;
+
+    if (Object.keys(request.body).length === 0) {
+        return reply.code(400).send(buildResponse(400, 'SxGR400', { message: 'No hay datos para actualizar.' }));
+    }
+
     try {
         const { data: grupo } = await supabase.from('grupos').select('creador_id').eq('id', id).single();
         const esDuenio = grupo.creador_id === usuario.sub;
         const esAdminGlobal = usuario.permisos?.global.includes('group:edit');
 
-        // REGLA: Si no es el dueño ni admin global, bloqueamos
         if (!esDuenio && !esAdminGlobal) {
             return reply.code(403).send(buildResponse(403, 'SxGR403', { message: 'Sin permiso global ni de propietario.' }));
         }
 
         const { data: actualizado } = await supabase.from('grupos').update(request.body).eq('id', id).select().single();
         return buildResponse(200, 'SxGR200', { message: 'Actualizado', grupo: actualizado });
-    } catch (err) { reply.code(500).send(buildResponse(500, 'SxGR500', { message: 'Error' })); }
+    } catch (err) { 
+        reply.code(500).send(buildResponse(500, 'SxGR500', { message: 'Error' })); 
+    }
 });
 
 // -------------------------------------------------------
@@ -229,9 +287,9 @@ fastify.delete('/groups/:id', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// POST — agregar miembro a grupo
+// POST — agregar miembro a grupo (con Schema)
 // -------------------------------------------------------
-fastify.post('/groups/:id/members', async (request, reply) => {
+fastify.post('/groups/:id/members', { schema: addMemberSchema }, async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) return reply.code(401).send(buildResponse(401, 'SxGR401', { message: 'Token inválido.' }));
 
@@ -249,12 +307,14 @@ fastify.post('/groups/:id/members', async (request, reply) => {
 
         await supabase.from('grupo_miembros').insert([{ grupo_id: id, usuario_id }]);
         return buildResponse(201, 'SxGR201', { message: 'Miembro agregado' });
-    } catch (err) { reply.code(500).send(buildResponse(500, 'SxGR500', { message: 'Error' })); }
+    } catch (err) { 
+        if(err.code === '23505') return reply.code(400).send(buildResponse(400, 'SxGR400', { message: 'El usuario ya es miembro.' }));
+        reply.code(500).send(buildResponse(500, 'SxGR500', { message: 'Error' })); 
+    }
 });
 
 // -------------------------------------------------------
 // DELETE — remover miembro de grupo
-// FIX: usuario_id viene en params, NO en body
 // -------------------------------------------------------
 fastify.delete('/groups/:id/members/:usuario_id', async (request, reply) => {
     const usuario = verificarToken(request);
@@ -271,7 +331,6 @@ fastify.delete('/groups/:id/members/:usuario_id', async (request, reply) => {
             return reply.code(403).send(buildResponse(403, 'SxGR403', { message: 'Solo el creador o un Admin pueden remover miembros.' }));
         }
 
-        // Evitar que el creador se elimine a sí mismo
         if (grupo.creador_id === Number(usuario_id)) {
              return reply.code(400).send(buildResponse(400, 'SxGR400', { message: 'El creador no puede ser removido del grupo.' }));
         }
@@ -282,21 +341,16 @@ fastify.delete('/groups/:id/members/:usuario_id', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// POST — asignar permiso a usuario en grupo
+// POST — asignar permiso a usuario en grupo (con Schema)
 // -------------------------------------------------------
-fastify.post('/groups/:id/permissions', async (request, reply) => {
+fastify.post('/groups/:id/permissions', { schema: permissionSchema }, async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) return reply.code(401).send(buildResponse(401, 'SxGR401', { message: 'Token inválido o expirado.' }));
 
     const { id } = request.params;
-    const { usuario_id, permiso_nombre } = request.body || {};
-
-    if (!usuario_id || !permiso_nombre) {
-        return reply.code(400).send(buildResponse(400, 'SxGR400', { message: 'usuario_id y permiso_nombre son obligatorios.' }));
-    }
+    const { usuario_id, permiso_nombre } = request.body;
 
     try {
-        // 1. VALIDACIÓN DE DUEÑO O ADMIN
         const { data: grupo } = await supabase.from('grupos').select('creador_id').eq('id', id).single();
         const esDuenio = grupo.creador_id === usuario.sub;
         const esAdminGlobal = usuario.permisos?.global.includes('group:manage') || usuario.permisos?.global.includes('user:manage');
@@ -305,7 +359,6 @@ fastify.post('/groups/:id/permissions', async (request, reply) => {
             return reply.code(403).send(buildResponse(403, 'SxGR403', { message: 'Solo el creador del grupo puede asignar permisos.' }));
         }
 
-        // 2. BUSCAR EL ID DEL PERMISO
         const { data: permiso, error: permisoError } = await supabase
             .from('permisos')
             .select('id')
@@ -314,7 +367,6 @@ fastify.post('/groups/:id/permissions', async (request, reply) => {
 
         if (permisoError || !permiso) return reply.code(404).send(buildResponse(404, 'SxGR404', { message: `Permiso '${permiso_nombre}' no existe.` }));
 
-        // 3. ASIGNAR PERMISO AL GRUPO
         const { data, error } = await supabase
             .from('grupo_usuario_permisos')
             .insert([{ grupo_id: id, usuario_id, permiso_id: permiso.id }])
@@ -335,8 +387,6 @@ fastify.post('/groups/:id/permissions', async (request, reply) => {
 
 // -------------------------------------------------------
 // DELETE — revocar permiso a usuario en grupo
-// FIX: Fastify puede recibir body vacío en DELETE — siempre usar || {}
-// y leer también desde query params como fallback
 // -------------------------------------------------------
 fastify.delete('/groups/:id/permissions', async (request, reply) => {
     const usuario = verificarToken(request);
@@ -352,7 +402,6 @@ fastify.delete('/groups/:id/permissions', async (request, reply) => {
     }
 
     try {
-        // 1. VALIDACIÓN DE DUEÑO O ADMIN
         const { data: grupo } = await supabase.from('grupos').select('creador_id').eq('id', id).single();
         const esDuenio = grupo.creador_id === usuario.sub;
         const esAdminGlobal = usuario.permisos?.global.includes('group:manage') || usuario.permisos?.global.includes('user:manage');
@@ -361,7 +410,6 @@ fastify.delete('/groups/:id/permissions', async (request, reply) => {
             return reply.code(403).send(buildResponse(403, 'SxGR403', { message: 'Solo el creador del grupo puede remover permisos.' }));
         }
 
-        // 2. BUSCAR EL ID DEL PERMISO
         const { data: permiso } = await supabase
             .from('permisos')
             .select('id')
@@ -370,7 +418,6 @@ fastify.delete('/groups/:id/permissions', async (request, reply) => {
 
         if (!permiso) return reply.code(404).send(buildResponse(404, 'SxGR404', { message: `Permiso '${permiso_nombre}' no existe.` }));
 
-        // 3. ELIMINAR PERMISO DEL GRUPO
         const { error } = await supabase
             .from('grupo_usuario_permisos')
             .delete()

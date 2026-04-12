@@ -12,6 +12,61 @@ const SALT_ROUNDS = 10;
 // --- CORS ---
 fastify.register(require('@fastify/cors'), { origin: true });
 
+// =======================================================
+// SCHEMAS DE VALIDACIÓN (AJV nativo de Fastify)
+// =======================================================
+
+const registerSchema = {
+    body: {
+        type: 'object',
+        required: ['nombre_completo', 'username', 'email', 'password'],
+        properties: {
+            nombre_completo: { type: 'string', minLength: 3 },
+            username: { type: 'string', minLength: 4 },
+            email: { type: 'string', format: 'email' },
+            password: { type: 'string', minLength: 6 },
+            direccion: { type: ['string', 'null'] },
+            telefono: { type: ['string', 'null'], maxLength: 10 }
+        }
+    }
+};
+
+const loginSchema = {
+    body: {
+        type: 'object',
+        required: ['email', 'password'],
+        properties: {
+            email: { type: 'string', format: 'email' },
+            password: { type: 'string', minLength: 1 }
+        }
+    }
+};
+
+const updateUserSchema = {
+    body: {
+        type: 'object',
+        properties: {
+            nombre_completo: { type: 'string', minLength: 3 },
+            username: { type: 'string', minLength: 4 },
+            direccion: { type: ['string', 'null'] },
+            telefono: { type: ['string', 'null'], maxLength: 10 },
+            password: { type: 'string', minLength: 6 }
+        }
+    }
+};
+
+// Interceptor global para errores de validación de JSON Schema
+fastify.setErrorHandler(function (error, request, reply) {
+    if (error.validation) {
+        reply.code(400).send(buildResponse(400, 'SxUS400', {
+            message: `Error de validación: ${error.message}`
+        }));
+    } else {
+        reply.send(error);
+    }
+});
+
+
 // -------------------------------------------------------
 // HEALTH CHECK
 // -------------------------------------------------------
@@ -22,20 +77,15 @@ fastify.get('/health', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// REGISTER
+// REGISTER (con Schema)
 // -------------------------------------------------------
-fastify.post('/auth/register', async (request, reply) => {
+fastify.post('/auth/register', { schema: registerSchema }, async (request, reply) => {
     const { nombre_completo, username, email, password, direccion, telefono } = request.body;
-
-    if (!nombre_completo || !username || !email || !password) {
-        reply.code(400);
-        return buildResponse(400, 'SxUS400', { message: 'Campos obligatorios faltantes.' });
-    }
 
     try {
         const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
-        // 1. Insertar el usuario en la tabla principal
+        // 1. Insertar el usuario
         const { data: newUser, error: insertError } = await supabase
             .from('usuarios')
             .insert([{
@@ -46,8 +96,7 @@ fastify.post('/auth/register', async (request, reply) => {
 
         if (insertError) throw insertError;
 
-        // 2. ASIGNAR PERMISOS POR DEFAULT (Globales)
-        // Agregamos 'group:view' a la lista para que no aparezca el candado rojo al iniciar
+        // 2. ASIGNAR PERMISOS POR DEFAULT
         const { data: defaultPerms } = await supabase
             .from('permisos')
             .select('id')
@@ -58,7 +107,6 @@ fastify.post('/auth/register', async (request, reply) => {
                 usuario_id: newUser.id,
                 permiso_id: p.id
             }));
-            // Insertamos en la nueva tabla de permisos globales
             await supabase.from('usuario_permisos_globales').insert(permsToInsert);
         }
 
@@ -76,9 +124,9 @@ fastify.post('/auth/register', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// LOGIN
+// LOGIN (con Schema)
 // -------------------------------------------------------
-fastify.post('/auth/login', async (request, reply) => {
+fastify.post('/auth/login', { schema: loginSchema }, async (request, reply) => {
     const { email, password } = request.body;
 
     try {
@@ -99,31 +147,24 @@ fastify.post('/auth/login', async (request, reply) => {
             return buildResponse(401, 'SxUS401', { message: 'Credenciales incorrectas.' });
         }
 
-        // ============================================================
-        // NUEVO: ACTUALIZAR EL LAST_LOGIN AL INICIAR SESIÓN
-        // ============================================================
         const fechaActual = new Date().toISOString();
         await supabase
             .from('usuarios')
             .update({ last_login: fechaActual })
             .eq('id', usuario.id);
         
-        // Actualizamos el objeto en memoria para enviarlo al frontend
         usuario.last_login = fechaActual;
 
-        // 1. Obtener Permisos Globales
         const { data: globales } = await supabase
             .from('usuario_permisos_globales')
             .select('permisos(nombre)')
             .eq('usuario_id', usuario.id);
 
-        // 2. Obtener Permisos por Grupo
         const { data: porGrupo } = await supabase
             .from('grupo_usuario_permisos')
             .select('grupo_id, permisos(nombre)')
             .eq('usuario_id', usuario.id);
 
-        // 3. Estructurar para el JWT
         const permisosJWT = {
             global: globales ? globales.map(g => g.permisos.nombre) : [],
             grupos: {}
@@ -153,7 +194,7 @@ fastify.post('/auth/login', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// GET TODOS LOS USUARIOS (requiere token — lo valida el API Gateway)
+// GET TODOS LOS USUARIOS
 // -------------------------------------------------------
 fastify.get('/users', async (request, reply) => {
     try {
@@ -187,23 +228,29 @@ fastify.get('/users/:id', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// PATCH USUARIO (actualizar datos básicos)
+// PATCH USUARIO (con Schema)
 // -------------------------------------------------------
-fastify.patch('/users/:id', async (request, reply) => {
+fastify.patch('/users/:id', { schema: updateUserSchema }, async (request, reply) => {
     const { id } = request.params;
     const body = { ...request.body };
-    delete body.id; delete body.password; delete body.email; delete body.creado_en;
+    delete body.id; delete body.email; delete body.creado_en;
 
     try {
+        // Si mandan password, hay que hashearlo de nuevo
+        if (body.password) {
+            body.password = await bcrypt.hash(body.password, SALT_ROUNDS);
+        }
+
         const { data: updatedUser, error } = await supabase
             .from('usuarios')
             .update(body)
             .eq('id', id)
-            .select().single();
+            .select('id, nombre_completo, username, direccion, telefono').single();
+            
         if (error) return buildResponse(404, 'SxUS404', { message: 'No encontrado.' });
         return buildResponse(200, 'SxUS200', { message: 'Actualizado.', user: updatedUser });
     } catch (err) {
-        reply.code(500).send(buildResponse(500, 'SxUS500', { message: 'Error.' }));
+        reply.code(500).send(buildResponse(500, 'SxUS500', { message: 'Error al actualizar.' }));
     }
 });
 
@@ -233,7 +280,9 @@ fastify.delete('/users/:id', async (request, reply) => {
     }
 });
 
-// Obtener permisos globales de un usuario
+// -------------------------------------------------------
+// RUTAS DE PERMISOS
+// -------------------------------------------------------
 fastify.get('/users/:id/permissions', async (request, reply) => {
     const { id } = request.params;
     const { data, error } = await supabase

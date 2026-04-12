@@ -11,6 +11,71 @@ const JWT_SECRET = process.env.JWT_SECRET;
 // --- CORS ---
 fastify.register(require('@fastify/cors'), { origin: true });
 
+// =======================================================
+// SCHEMAS DE VALIDACIÓN (AJV nativo de Fastify)
+// =======================================================
+
+const createTicketSchema = {
+    body: {
+        type: 'object',
+        required: ['grupo_id', 'titulo'],
+        properties: {
+            grupo_id: { type: ['integer', 'string'] },
+            titulo: { type: 'string', minLength: 1 },
+            descripcion: { type: ['string', 'null'] },
+            prioridad: { type: 'string', enum: ['Alta', 'Media', 'Baja'] },
+            asignado_id: { type: ['integer', 'null'] }
+        }
+    }
+};
+
+const updateTicketSchema = {
+    body: {
+        type: 'object',
+        required: ['grupo_id'], // Obligatorio para validar permisos
+        properties: {
+            grupo_id: { type: ['integer', 'string'] },
+            titulo: { type: 'string', minLength: 1 },
+            descripcion: { type: ['string', 'null'] },
+            prioridad: { type: 'string', enum: ['Alta', 'Media', 'Baja'] },
+            asignado_id: { type: ['integer', 'null'] }
+        }
+    }
+};
+
+const statusTicketSchema = {
+    body: {
+        type: 'object',
+        required: ['grupo_id', 'estado'],
+        properties: {
+            grupo_id: { type: ['integer', 'string'] },
+            estado: { type: 'string', enum: ['Pendiente', 'En Progreso', 'Completado'] }
+        }
+    }
+};
+
+const commentSchema = {
+    body: {
+        type: 'object',
+        required: ['texto'],
+        properties: {
+            texto: { type: 'string', minLength: 1 }
+        }
+    }
+};
+
+// Interceptor global para errores de validación de JSON Schema
+fastify.setErrorHandler(function (error, request, reply) {
+    if (error.validation) {
+        reply.code(400).send(buildResponse(400, 'SxTK400', {
+            message: `Error de validación: ${error.message}`
+        }));
+    } else {
+        reply.send(error);
+    }
+});
+
+
 // -------------------------------------------------------
 // HELPER — verificar token JWT
 // -------------------------------------------------------
@@ -46,9 +111,6 @@ fastify.get('/health', async (request, reply) => {
 // -------------------------------------------------------
 // GET — listar tickets por grupo
 // -------------------------------------------------------
-// -------------------------------------------------------
-// GET — listar tickets por grupo (o todos si grupo_id es 'all')
-// -------------------------------------------------------
 fastify.get('/tickets/group/:grupo_id', async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) {
@@ -57,8 +119,7 @@ fastify.get('/tickets/group/:grupo_id', async (request, reply) => {
     }
 
     const { grupo_id } = request.params;
-    const { asignado_id } = request.query;
-    const { estado, prioridad } = request.query;
+    const { asignado_id, estado, prioridad } = request.query;
 
     try {
         let query = supabase
@@ -75,8 +136,6 @@ fastify.get('/tickets/group/:grupo_id', async (request, reply) => {
 
         if (estado) query = query.eq('estado', estado);
         if (prioridad) query = query.eq('prioridad', prioridad);
-        
-        // Filtro fundamental para el Perfil
         if (asignado_id) query = query.eq('asignado_id', asignado_id);
 
         const { data: tickets, error } = await query.order('creado_en', { ascending: false });
@@ -120,7 +179,6 @@ fastify.get('/tickets/:id', async (request, reply) => {
             return buildResponse(404, 'SxTK404', { message: 'Ticket no encontrado.' });
         }
 
-        // Traer comentarios
         const { data: comentarios } = await supabase
             .from('ticket_comentarios')
             .select(`
@@ -130,7 +188,6 @@ fastify.get('/tickets/:id', async (request, reply) => {
             .eq('ticket_id', id)
             .order('creado_en', { ascending: true });
 
-        // Traer historial
         const { data: historial } = await supabase
             .from('ticket_historial')
             .select(`
@@ -154,21 +211,16 @@ fastify.get('/tickets/:id', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// POST — crear ticket
+// POST — crear ticket (Con Schema)
 // -------------------------------------------------------
-fastify.post('/tickets', async (request, reply) => {
+fastify.post('/tickets', { schema: createTicketSchema }, async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) {
         reply.code(401);
         return buildResponse(401, 'SxTK401', { message: 'Token inválido o expirado.' });
     }
 
-    const { grupo_id, titulo, descripcion, prioridad, asignado_id } = request.body || {};
-
-    if (!grupo_id || !titulo) {
-        reply.code(400);
-        return buildResponse(400, 'SxTK400', { message: 'grupo_id y titulo son obligatorios.' });
-    }
+    const { grupo_id, titulo, descripcion, prioridad, asignado_id } = request.body;
 
     try {
         const { data: nuevoTicket, error } = await supabase
@@ -187,12 +239,7 @@ fastify.post('/tickets', async (request, reply) => {
 
         if (error) throw error;
 
-        // Registrar en historial
-        await registrarHistorial(
-            nuevoTicket.id, 
-            usuario.sub, 
-            'Ticket creado'
-        );
+        await registrarHistorial(nuevoTicket.id, usuario.sub, 'Ticket creado');
 
         reply.code(201);
         return buildResponse(201, 'SxTK201', { 
@@ -208,18 +255,14 @@ fastify.post('/tickets', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// PATCH — editar ticket (titulo, descripcion, prioridad, asignado)
+// PATCH — editar ticket (Con Schema)
 // -------------------------------------------------------
-fastify.patch('/tickets/:id', async (request, reply) => {
+fastify.patch('/tickets/:id', { schema: updateTicketSchema }, async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) return reply.code(401).send(buildResponse(401, 'SxTK401', { message: 'Token inválido.' }));
 
     const { id } = request.params;
-    const { grupo_id, ...datosAActualizar } = request.body || {};
-
-    if (!grupo_id) {
-        return reply.code(400).send(buildResponse(400, 'SxTK400', { message: 'El grupo_id es obligatorio para validar permisos.' }));
-    }
+    const { grupo_id, ...datosAActualizar } = request.body;
 
     try {
         const permisosDelGrupo = usuario.permisos?.grupos[String(grupo_id)] || [];
@@ -228,11 +271,6 @@ fastify.patch('/tickets/:id', async (request, reply) => {
         if (!tienePermisoEdit) {
             return reply.code(403).send(buildResponse(403, 'SxTK403', { message: 'No tienes permiso para editar tickets en este grupo.' }));
         }
-
-        // Limpiar campos protegidos
-        delete datosAActualizar.id;
-        delete datosAActualizar.autor_id;
-        delete datosAActualizar.creado_en;
 
         const { data: ticketActualizado, error } = await supabase
             .from('tickets')
@@ -257,11 +295,9 @@ fastify.patch('/tickets/:id', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// PATCH — cambiar estado del ticket
-// Regla: solo si el ticket está asignado al usuario
-// El permiso tickets:move lo valida el API Gateway
+// PATCH — cambiar estado del ticket (Con Schema)
 // -------------------------------------------------------
-fastify.patch('/tickets/:id/status', async (request, reply) => {
+fastify.patch('/tickets/:id/status', { schema: statusTicketSchema }, async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) {
         reply.code(401);
@@ -269,21 +305,7 @@ fastify.patch('/tickets/:id/status', async (request, reply) => {
     }
 
     const { id } = request.params;
-    // Ahora extraemos el grupo_id que nos manda Angular
-    const { estado, grupo_id } = request.body || {}; 
-
-    if (!estado || !grupo_id) { // Validamos que nos llegue
-        reply.code(400);
-        return buildResponse(400, 'SxTK400', { message: 'El nuevo estado y el grupo_id son obligatorios.' });
-    }
-
-    const estadosValidos = ['Pendiente', 'En Progreso', 'Completado'];
-    if (!estadosValidos.includes(estado)) {
-        reply.code(400);
-        return buildResponse(400, 'SxTK400', { 
-            message: `Estado inválido. Los estados válidos son: ${estadosValidos.join(', ')}.` 
-        });
-    }
+    const { estado } = request.body; 
 
     try {
         const { data: ticket, error: fetchError } = await supabase
@@ -297,8 +319,6 @@ fastify.patch('/tickets/:id/status', async (request, reply) => {
             return buildResponse(404, 'SxTK404', { message: 'Ticket no encontrado.' });
         }
 
-        // Validar que el ticket está asignado al usuario que hace el request
-        // (O si quieres que los admins también puedan moverlo, añade la lógica aquí)
         if (ticket.asignado_id !== usuario.sub) {
             reply.code(403);
             return buildResponse(403, 'SxTK403', { 
@@ -365,9 +385,9 @@ fastify.delete('/tickets/:id', async (request, reply) => {
 });
 
 // -------------------------------------------------------
-// POST — agregar comentario
+// POST — agregar comentario (Con Schema)
 // -------------------------------------------------------
-fastify.post('/tickets/:id/comments', async (request, reply) => {
+fastify.post('/tickets/:id/comments', { schema: commentSchema }, async (request, reply) => {
     const usuario = verificarToken(request);
     if (!usuario) {
         reply.code(401);
@@ -375,12 +395,7 @@ fastify.post('/tickets/:id/comments', async (request, reply) => {
     }
 
     const { id } = request.params;
-    const { texto } = request.body || {};
-
-    if (!texto || texto.trim() === '') {
-        reply.code(400);
-        return buildResponse(400, 'SxTK400', { message: 'El texto del comentario es obligatorio.' });
-    }
+    const { texto } = request.body;
 
     try {
         const { data: comentario, error } = await supabase
@@ -424,7 +439,6 @@ fastify.delete('/tickets/:id/comments/:comentario_id', async (request, reply) =>
     const { comentario_id } = request.params;
 
     try {
-        // Solo puede borrar el autor del comentario
         const { data: comentario } = await supabase
             .from('ticket_comentarios')
             .select('autor_id')
