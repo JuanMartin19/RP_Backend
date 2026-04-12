@@ -212,44 +212,38 @@ fastify.post('/tickets', async (request, reply) => {
 // -------------------------------------------------------
 fastify.patch('/tickets/:id', async (request, reply) => {
     const usuario = verificarToken(request);
-    if (!usuario) {
-        reply.code(401);
-        return buildResponse(401, 'SxTK401', { message: 'Token inválido o expirado.' });
-    }
+    if (!usuario) return reply.code(401).send(buildResponse(401, 'SxTK401', { message: 'Token inválido.' }));
 
     const { id } = request.params;
-    const body = { ...request.body };
+    const { grupo_id, ...datosAActualizar } = request.body || {};
 
-    // Campos que NO se pueden modificar por esta ruta
-    delete body.id;
-    delete body.estado;       // el estado tiene su propia ruta
-    delete body.autor_id;
-    delete body.grupo_id;
-    delete body.creado_en;
-
-    if (Object.keys(body).length === 0) {
-        reply.code(400);
-        return buildResponse(400, 'SxTK400', { message: 'No hay campos válidos para actualizar.' });
+    if (!grupo_id) {
+        return reply.code(400).send(buildResponse(400, 'SxTK400', { message: 'El grupo_id es obligatorio para validar permisos.' }));
     }
 
     try {
+        const permisosDelGrupo = usuario.permisos?.grupos[String(grupo_id)] || [];
+        const tienePermisoEdit = permisosDelGrupo.includes('ticket:edit') || usuario.permisos?.global.includes('ticket:manage');
+
+        if (!tienePermisoEdit) {
+            return reply.code(403).send(buildResponse(403, 'SxTK403', { message: 'No tienes permiso para editar tickets en este grupo.' }));
+        }
+
+        // Limpiar campos protegidos
+        delete datosAActualizar.id;
+        delete datosAActualizar.autor_id;
+        delete datosAActualizar.creado_en;
+
         const { data: ticketActualizado, error } = await supabase
             .from('tickets')
-            .update(body)
+            .update(datosAActualizar)
             .eq('id', id)
             .select()
             .single();
 
-        if (error) {
-            reply.code(404);
-            return buildResponse(404, 'SxTK404', { message: 'Ticket no encontrado.' });
-        }
+        if (error) throw error;
 
-        await registrarHistorial(
-            id, 
-            usuario.sub, 
-            `Ticket editado: ${Object.keys(body).join(', ')}`
-        );
+        await registrarHistorial(id, usuario.sub, `Ticket editado por el usuario.`);
 
         return buildResponse(200, 'SxTK200', { 
             message: 'Ticket actualizado correctamente.', 
@@ -258,8 +252,7 @@ fastify.patch('/tickets/:id', async (request, reply) => {
 
     } catch (err) {
         console.error('Error PATCH /tickets/:id:', err.message);
-        reply.code(500);
-        return buildResponse(500, 'SxTK500', { message: 'Error al editar el ticket.' });
+        reply.code(500).send(buildResponse(500, 'SxTK500', { message: 'Error al editar el ticket.' }));
     }
 });
 
@@ -276,11 +269,12 @@ fastify.patch('/tickets/:id/status', async (request, reply) => {
     }
 
     const { id } = request.params;
-    const { estado } = request.body || {};
+    // Ahora extraemos el grupo_id que nos manda Angular
+    const { estado, grupo_id } = request.body || {}; 
 
-    if (!estado) {
+    if (!estado || !grupo_id) { // Validamos que nos llegue
         reply.code(400);
-        return buildResponse(400, 'SxTK400', { message: 'El nuevo estado es obligatorio.' });
+        return buildResponse(400, 'SxTK400', { message: 'El nuevo estado y el grupo_id son obligatorios.' });
     }
 
     const estadosValidos = ['Pendiente', 'En Progreso', 'Completado'];
@@ -292,7 +286,6 @@ fastify.patch('/tickets/:id/status', async (request, reply) => {
     }
 
     try {
-        // Verificar que el ticket existe y está asignado al usuario
         const { data: ticket, error: fetchError } = await supabase
             .from('tickets')
             .select('id, estado, asignado_id')
@@ -305,6 +298,7 @@ fastify.patch('/tickets/:id/status', async (request, reply) => {
         }
 
         // Validar que el ticket está asignado al usuario que hace el request
+        // (O si quieres que los admins también puedan moverlo, añade la lógica aquí)
         if (ticket.asignado_id !== usuario.sub) {
             reply.code(403);
             return buildResponse(403, 'SxTK403', { 

@@ -53,18 +53,19 @@ function verificarToken(authHeader) {
 // basta con que tenga ese permiso en al menos un grupo.
 // -------------------------------------------------------
 function tienePermiso(usuario, grupo_id, permiso_requerido) {
-    const permisosPorGrupo = usuario.permisos || {};
+    const todosLosPermisos = usuario.permisos || { global: [], grupos: {} };
     
+    // 1. ¿Tiene el permiso a nivel Global? (Aplica para todo el sistema)
+    const tieneGlobal = todosLosPermisos.global.includes(permiso_requerido);
+    if (tieneGlobal) return true;
+
+    // 2. ¿Tiene el permiso en el grupo específico?
     if (grupo_id) {
-        // Verificar solo en el grupo específico
-        const permisosGrupo = permisosPorGrupo[String(grupo_id)] || [];
-        return permisosGrupo.includes(permiso_requerido);
-    } else {
-        // Sin grupo específico: verificar en CUALQUIER grupo
-        return Object.values(permisosPorGrupo).some(permisos =>
-            permisos.includes(permiso_requerido)
-        );
+        const permisosDelGrupo = todosLosPermisos.grupos[String(grupo_id)] || [];
+        return permisosDelGrupo.includes(permiso_requerido);
     }
+
+    return false;
 }
 
 // -------------------------------------------------------
@@ -95,20 +96,26 @@ async function proxyRequest(reply, serviceUrl, path, request) {
 // MATRIZ DE PERMISOS POR ENDPOINT
 // -------------------------------------------------------
 const PERMISOS_REQUERIDOS = {
-    'POST /tickets':                          { permiso: 'ticket:add',       necesitaGrupo: true  },
-    'PATCH /tickets/:id':                     { permiso: 'ticket:edit',      necesitaGrupo: true  },
-    'PATCH /tickets/:id/status':              { permiso: 'ticket:edit:state',necesitaGrupo: true  },
-    'DELETE /tickets/:id':                    { permiso: 'ticket:delete',    necesitaGrupo: true  },
-    'POST /groups':                           { permiso: 'group:manage',     necesitaGrupo: false },
-    'PATCH /groups/:id':                      { permiso: 'group:manage',     necesitaGrupo: false },
-    'DELETE /groups/:id':                     { permiso: 'group:manage',     necesitaGrupo: false },
-    'POST /groups/:id/members':               { permiso: 'group:manage',     necesitaGrupo: false },
-    'DELETE /groups/:id/members/:usuario_id': { permiso: 'group:manage',     necesitaGrupo: false },
-    'POST /groups/:id/permissions':           { permiso: 'user:manage',      necesitaGrupo: false },
-    'DELETE /groups/:id/permissions':         { permiso: 'user:manage',      necesitaGrupo: false },
-    'GET /users':                             { permiso: 'user:manage',      necesitaGrupo: false },
-    'DELETE /users/:id':                      { permiso: 'user:manage',      necesitaGrupo: false },
-    'GET /users/:id/groups':                  { permiso: 'user:manage', necesitaGrupo: false },
+    'POST /tickets':                          { permiso: 'ticket:add',        necesitaGrupo: true  },
+    'PATCH /tickets/:id':                     { permiso: 'ticket:edit',       necesitaGrupo: true  }, // Esta es la única que debe quedar
+    'PATCH /tickets/:id/status':              { permiso: 'ticket:edit:state', necesitaGrupo: true  },
+    'DELETE /tickets/:id':                    { permiso: 'ticket:delete',     necesitaGrupo: true  },
+    
+    'GET /groups/all':                        { permiso: 'group:view',    necesitaGrupo: false },
+    'POST /groups':                           { permiso: 'group:add',     necesitaGrupo: false },
+    'PATCH /groups/:id':                      { permiso: 'group:view',    necesitaGrupo: false },
+    'POST /groups/:id/members':               { permiso: 'group:view',    necesitaGrupo: false },
+    'DELETE /groups/:id':                     { permiso: 'group:delete',  necesitaGrupo: false }, 
+    'DELETE /groups/:id/members/:usuario_id': { permiso: 'group:view',    necesitaGrupo: false },
+    'POST /groups/:id/permissions':           { permiso: 'group:view',    necesitaGrupo: false },
+    'DELETE /groups/:id/permissions':         { permiso: 'group:view',    necesitaGrupo: false },
+    
+    'GET /users':                             { permiso: 'user:view',     necesitaGrupo: false },
+    'DELETE /users/:id':                      { permiso: 'user:manage',   necesitaGrupo: false },
+    'GET /users/:id/groups':                  { permiso: 'user:manage',   necesitaGrupo: false },
+    'GET /users/:id/permissions':             { permiso: 'user:manage',   necesitaGrupo: false },
+    'POST /users/:id/permissions':            { permiso: 'user:manage',   necesitaGrupo: false },
+    'DELETE /users/:id/permissions':          { permiso: 'user:manage',   necesitaGrupo: false },
 };
 
 // -------------------------------------------------------
@@ -182,12 +189,25 @@ fastify.post('/auth/login', async (request, reply) => {
 // -------------------------------------------------------
 // RUTAS DE USUARIOS
 // -------------------------------------------------------
-fastify.get('/users', async (request, reply) => {
-    await proxyRequest(reply, SERVICES.users, '/users', request);
+fastify.get('/users/:id/permissions', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, `/users/${request.params.id}/permissions`, request);
+});
+
+fastify.post('/users/:id/permissions', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, `/users/${request.params.id}/permissions`, request);
+});
+
+fastify.delete('/users/:id/permissions', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, `/users/${request.params.id}/permissions`, request);
 });
 
 fastify.get('/users/:usuario_id/groups', async (request, reply) => {
     await proxyRequest(reply, SERVICES.groups, `/users/${request.params.usuario_id}/groups`, request);
+});
+
+// 2. RUTAS GENÉRICAS (Deben ir DESPUÉS)
+fastify.get('/users', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, '/users', request);
 });
 
 fastify.get('/users/:id', async (request, reply) => {
@@ -298,5 +318,4 @@ const start = async () => {
         process.exit(1);
     }
 };
-
 start();

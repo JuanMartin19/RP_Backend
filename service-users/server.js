@@ -27,78 +27,49 @@ fastify.get('/health', async (request, reply) => {
 fastify.post('/auth/register', async (request, reply) => {
     const { nombre_completo, username, email, password, direccion, telefono } = request.body;
 
-    // 1. Validar campos obligatorios
     if (!nombre_completo || !username || !email || !password) {
         reply.code(400);
-        return buildResponse(400, 'SxUS400', { 
-            message: 'nombre_completo, username, email y password son obligatorios.' 
-        });
-    }
-
-    // 2. Validar formato de email
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email)) {
-        reply.code(400);
-        return buildResponse(400, 'SxUS400', { message: 'Formato de email inválido.' });
-    }
-
-    // 3. Validar longitud de password
-    if (password.length < 6) {
-        reply.code(400);
-        return buildResponse(400, 'SxUS400', { 
-            message: 'La contraseña debe tener al menos 6 caracteres.' 
-        });
+        return buildResponse(400, 'SxUS400', { message: 'Campos obligatorios faltantes.' });
     }
 
     try {
-        // 4. Verificar si email o username ya existen
-        const { data: existingUser } = await supabase
-            .from('usuarios')
-            .select('username, email')
-            .or(`email.eq.${email},username.eq.${username}`)
-            .maybeSingle();
-
-        if (existingUser) {
-            reply.code(400);
-            if (existingUser.email === email) {
-                return buildResponse(400, 'SxUS400', { message: 'El correo ya está registrado.' });
-            }
-            if (existingUser.username === username) {
-                return buildResponse(400, 'SxUS400', { message: 'El nombre de usuario no está disponible.' });
-            }
-        }
-
-        // 5. Hashear password
         const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
-        // 6. Insertar usuario
+        // 1. Insertar el usuario en la tabla principal
         const { data: newUser, error: insertError } = await supabase
             .from('usuarios')
             .insert([{
-                nombre_completo,
-                username,
-                email,
-                password: hashedPassword,
-                direccion: direccion || null,
-                telefono: telefono || null
+                nombre_completo, username, email,
+                password: hashedPassword, direccion, telefono
             }])
-            .select('id, nombre_completo, username, email, creado_en')
-            .single();
+            .select().single();
 
-        if (insertError) {
-            console.error('Error al insertar usuario:', insertError.message);
-            reply.code(500);
-            return buildResponse(500, 'SxUS500', { message: 'Error al crear el usuario.' });
+        if (insertError) throw insertError;
+
+        // 2. ASIGNAR PERMISOS POR DEFAULT (Globales)
+        // Agregamos 'group:view' a la lista para que no aparezca el candado rojo al iniciar
+        const { data: defaultPerms } = await supabase
+            .from('permisos')
+            .select('id')
+            .in('nombre', ['user:edit:profile', 'user:view', 'group:view']);
+
+        if (defaultPerms && defaultPerms.length > 0) {
+            const permsToInsert = defaultPerms.map(p => ({
+                usuario_id: newUser.id,
+                permiso_id: p.id
+            }));
+            // Insertamos en la nueva tabla de permisos globales
+            await supabase.from('usuario_permisos_globales').insert(permsToInsert);
         }
 
         reply.code(201);
         return buildResponse(201, 'SxUS201', { 
-            message: '¡Registro exitoso!',
-            user: newUser
+            message: 'Registro exitoso. Ya puedes ver tus grupos.', 
+            user: newUser 
         });
 
     } catch (err) {
-        console.error('FATAL register:', err.message);
+        console.error('Error en registro:', err);
         reply.code(500);
         return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
     }
@@ -110,16 +81,7 @@ fastify.post('/auth/register', async (request, reply) => {
 fastify.post('/auth/login', async (request, reply) => {
     const { email, password } = request.body;
 
-    // 1. Validar campos obligatorios
-    if (!email || !password) {
-        reply.code(400);
-        return buildResponse(400, 'SxUS400', { 
-            message: 'Email y password son obligatorios.' 
-        });
-    }
-
     try {
-        // 2. Buscar usuario por email
         const { data: usuario, error } = await supabase
             .from('usuarios')
             .select('*')
@@ -131,58 +93,60 @@ fastify.post('/auth/login', async (request, reply) => {
             return buildResponse(401, 'SxUS401', { message: 'Credenciales incorrectas.' });
         }
 
-        // 3. Verificar password
         const passwordValido = await bcrypt.compare(password, usuario.password);
         if (!passwordValido) {
             reply.code(401);
             return buildResponse(401, 'SxUS401', { message: 'Credenciales incorrectas.' });
         }
 
-        // 4. Traer permisos del usuario por grupo
-        const { data: permisosData } = await supabase
-            .from('grupo_usuario_permisos')
-            .select(`
-                grupo_id,
-                permisos ( nombre )
-            `)
+        // ============================================================
+        // NUEVO: ACTUALIZAR EL LAST_LOGIN AL INICIAR SESIÓN
+        // ============================================================
+        const fechaActual = new Date().toISOString();
+        await supabase
+            .from('usuarios')
+            .update({ last_login: fechaActual })
+            .eq('id', usuario.id);
+        
+        // Actualizamos el objeto en memoria para enviarlo al frontend
+        usuario.last_login = fechaActual;
+
+        // 1. Obtener Permisos Globales
+        const { data: globales } = await supabase
+            .from('usuario_permisos_globales')
+            .select('permisos(nombre)')
             .eq('usuario_id', usuario.id);
 
-        // Agrupar permisos por grupo: { "1": ["tickets:add", "tickets:move"], "2": [...] }
-        const permisosPorGrupo = {};
-        if (permisosData) {
-            permisosData.forEach(({ grupo_id, permisos }) => {
-                if (!permisosPorGrupo[grupo_id]) permisosPorGrupo[grupo_id] = [];
-                permisosPorGrupo[grupo_id].push(permisos.nombre);
+        // 2. Obtener Permisos por Grupo
+        const { data: porGrupo } = await supabase
+            .from('grupo_usuario_permisos')
+            .select('grupo_id, permisos(nombre)')
+            .eq('usuario_id', usuario.id);
+
+        // 3. Estructurar para el JWT
+        const permisosJWT = {
+            global: globales ? globales.map(g => g.permisos.nombre) : [],
+            grupos: {}
+        };
+
+        if (porGrupo) {
+            porGrupo.forEach(item => {
+                if (!permisosJWT.grupos[item.grupo_id]) permisosJWT.grupos[item.grupo_id] = [];
+                permisosJWT.grupos[item.grupo_id].push(item.permisos.nombre);
             });
         }
 
-        // 5. Generar JWT
         const payload = {
             sub: usuario.id,
             username: usuario.username,
-            email: usuario.email,
-            permisos: permisosPorGrupo
+            permisos: permisosJWT
         };
 
         const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
 
-        // 6. Actualizar last_login
-        await supabase
-            .from('usuarios')
-            .update({ last_login: new Date().toISOString() })
-            .eq('id', usuario.id);
-
-        // 7. Responder sin exponer la password
-        const { password: _, ...usuarioSinPassword } = usuario;
-
-        return buildResponse(200, 'SxUS200', {
-            message: 'Acceso correcto.',
-            token,
-            user: usuarioSinPassword
-        });
+        return buildResponse(200, 'SxUS200', { token, user: usuario });
 
     } catch (err) {
-        console.error('FATAL login:', err.message);
         reply.code(500);
         return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
     }
@@ -196,13 +160,9 @@ fastify.get('/users', async (request, reply) => {
         const { data: users, error } = await supabase
             .from('usuarios')
             .select('id, nombre_completo, username, email, telefono, direccion, last_login, creado_en');
-
         if (error) throw error;
-
         return buildResponse(200, 'SxUS200', users);
-
     } catch (err) {
-        console.error('Error GET /users:', err.message);
         reply.code(500);
         return buildResponse(500, 'SxUS500', { message: 'Error al obtener usuarios.' });
     }
@@ -213,25 +173,16 @@ fastify.get('/users', async (request, reply) => {
 // -------------------------------------------------------
 fastify.get('/users/:id', async (request, reply) => {
     const { id } = request.params;
-
     try {
         const { data: usuario, error } = await supabase
             .from('usuarios')
             .select('id, nombre_completo, username, email, telefono, direccion, last_login, creado_en')
             .eq('id', id)
             .maybeSingle();
-
-        if (error || !usuario) {
-            reply.code(404);
-            return buildResponse(404, 'SxUS404', { message: 'Usuario no encontrado.' });
-        }
-
+        if (error || !usuario) return buildResponse(404, 'SxUS404', { message: 'No encontrado.' });
         return buildResponse(200, 'SxUS200', usuario);
-
     } catch (err) {
-        console.error('Error GET /users/:id:', err.message);
-        reply.code(500);
-        return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
+        reply.code(500).send(buildResponse(500, 'SxUS500', { message: 'Error.' }));
     }
 });
 
@@ -241,40 +192,18 @@ fastify.get('/users/:id', async (request, reply) => {
 fastify.patch('/users/:id', async (request, reply) => {
     const { id } = request.params;
     const body = { ...request.body };
-
-    // Campos que no se pueden modificar desde aquí
-    delete body.id;
-    delete body.password;
-    delete body.email;
-    delete body.creado_en;
-
-    if (Object.keys(body).length === 0) {
-        reply.code(400);
-        return buildResponse(400, 'SxUS400', { message: 'No hay campos válidos para actualizar.' });
-    }
+    delete body.id; delete body.password; delete body.email; delete body.creado_en;
 
     try {
         const { data: updatedUser, error } = await supabase
             .from('usuarios')
             .update(body)
             .eq('id', id)
-            .select('id, nombre_completo, username, email, telefono, direccion, last_login, creado_en')
-            .single();
-
-        if (error) {
-            reply.code(404);
-            return buildResponse(404, 'SxUS404', { message: 'Usuario no encontrado.' });
-        }
-
-        return buildResponse(200, 'SxUS200', { 
-            message: 'Perfil actualizado correctamente.', 
-            user: updatedUser 
-        });
-
+            .select().single();
+        if (error) return buildResponse(404, 'SxUS404', { message: 'No encontrado.' });
+        return buildResponse(200, 'SxUS200', { message: 'Actualizado.', user: updatedUser });
     } catch (err) {
-        console.error('Error PATCH /users/:id:', err.message);
-        reply.code(500);
-        return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
+        reply.code(500).send(buildResponse(500, 'SxUS500', { message: 'Error.' }));
     }
 });
 
@@ -304,17 +233,46 @@ fastify.delete('/users/:id', async (request, reply) => {
     }
 });
 
+// Obtener permisos globales de un usuario
+fastify.get('/users/:id/permissions', async (request, reply) => {
+    const { id } = request.params;
+    const { data, error } = await supabase
+        .from('usuario_permisos_globales')
+        .select('permisos(nombre)')
+        .eq('usuario_id', id);
+    
+    if (error) return buildResponse(500, 'SxUS500', { message: error.message });
+    const lista = data.map(item => item.permisos);
+    return buildResponse(200, 'SxUS200', lista);
+});
+
+fastify.post('/users/:id/permissions', async (request, reply) => {
+    const { id } = request.params;
+    const { permiso_nombre } = request.body;
+    const { data: permiso } = await supabase.from('permisos').select('id').eq('nombre', permiso_nombre).single();
+    if (!permiso) return buildResponse(404, 'SxUS404', { message: 'No encontrado.' });
+    await supabase.from('usuario_permisos_globales').insert({ usuario_id: id, permiso_id: permiso.id });
+    return buildResponse(201, 'SxUS201', { message: 'Permiso global asignado' });
+});
+
+fastify.delete('/users/:id/permissions', async (request, reply) => {
+    const { id } = request.params;
+    const { permiso_nombre } = request.body;
+    const { data: permiso } = await supabase.from('permisos').select('id').eq('nombre', permiso_nombre).single();
+    if (!permiso) return buildResponse(404, 'SxUS404', { message: 'No encontrado.' });
+    await supabase.from('usuario_permisos_globales').delete().eq('usuario_id', id).eq('permiso_id', permiso.id);
+    return buildResponse(200, 'SxUS200', { message: 'Permiso global removido' });
+});
+
 // -------------------------------------------------------
 // START
 // -------------------------------------------------------
 const start = async () => {
     try {
         await fastify.listen({ port: process.env.PORT || 3001, host: '0.0.0.0' });
-        console.log(`Servicio de Usuarios activo en puerto ${process.env.PORT || 3001}`);
+        console.log(`Servicio de Usuarios activo en puerto 3001`);
     } catch (err) {
-        console.error(err);
         process.exit(1);
     }
 };
-
 start();
