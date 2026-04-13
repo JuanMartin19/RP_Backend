@@ -118,6 +118,12 @@ fastify.post('/auth/register', { schema: registerSchema }, async (request, reply
 
     } catch (err) {
         console.error('Error en registro:', err);
+        if (err.code === '23505') {
+            reply.code(400);
+            return buildResponse(400, 'SxUS400', { 
+                message: 'El correo electrónico o nombre de usuario ya está registrado.' 
+            });
+        }
         reply.code(500);
         return buildResponse(500, 'SxUS500', { message: 'Error interno del servidor.' });
     }
