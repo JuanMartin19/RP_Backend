@@ -17,8 +17,13 @@ const SERVICES = {
 // -------------------------------------------------------
 // CORS
 // -------------------------------------------------------
+// -------------------------------------------------------
+// CORS
+// -------------------------------------------------------
 fastify.register(require('@fastify/cors'), {
-    origin: true,
+    origin: process.env.FRONTEND_URL 
+        ? [process.env.FRONTEND_URL, 'http://localhost:4200'] 
+        : true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 });
