@@ -72,7 +72,7 @@ fastify.setErrorHandler(function (error, request, reply) {
 // -------------------------------------------------------
 fastify.get('/health', async (request, reply) => {
     return buildResponse(200, 'SxUS200', { 
-        message: 'Servicio de usuarios funcionando correctamente' 
+        message: 'Servicio de usuarios funcionando correctamente.' 
     });
 });
 

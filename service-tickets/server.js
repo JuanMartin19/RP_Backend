@@ -104,7 +104,7 @@ async function registrarHistorial(ticket_id, autor_id, accion) {
 // -------------------------------------------------------
 fastify.get('/health', async (request, reply) => {
     return buildResponse(200, 'SxTK200', { 
-        message: 'Servicio de tickets funcionando correctamente' 
+        message: 'Servicio de tickets funcionando correctamente.' 
     });
 });
 

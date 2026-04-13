@@ -86,7 +86,7 @@ function verificarToken(request) {
 // -------------------------------------------------------
 fastify.get('/health', async (request, reply) => {
     return buildResponse(200, 'SxGR200', {
-        message: 'Servicio de grupos funcionando correctamente'
+        message: 'Servicio de grupos funcionando correctamente.'
     });
 });
 

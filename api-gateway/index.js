@@ -9,9 +9,9 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 const SERVICES = {
-    users:   'http://localhost:3001',
-    groups:  'http://localhost:3002',
-    tickets: 'http://localhost:3003'
+    users:   process.env.USERS_URL || 'http://localhost:3001',
+    groups:  process.env.GROUPS_URL || 'http://localhost:3002',
+    tickets: process.env.TICKETS_URL || 'http://localhost:3003'
 };
 
 // -------------------------------------------------------
@@ -180,7 +180,8 @@ fastify.addHook('preHandler', async (request, reply) => {
 // RUTAS PÚBLICAS
 // -------------------------------------------------------
 fastify.get('/health', async (request, reply) => {
-    return buildResponse(200, 'SxGW200', { message: 'API Gateway funcionando correctamente.' });
+    return buildResponse(200, 'SxGW200', {
+        message: 'API Gateway funcionando correctamente.' });
 });
 
 fastify.post('/auth/register', async (request, reply) => {
