@@ -320,6 +320,46 @@ fastify.delete('/users/:id/permissions', async (request, reply) => {
 });
 
 // -------------------------------------------------------
+// REFRESH TOKEN (Refresco Silencioso)
+// -------------------------------------------------------
+fastify.get('/auth/refresh', async (request, reply) => {
+    // Obtenemos el token actual del header
+    const authHeader = request.headers.authorization;
+    if (!authHeader) return buildResponse(401, 'SxUS401', { message: 'No token' });
+    const token = authHeader.split(' ')[1];
+    
+    let decoded;
+    try { decoded = jwt.verify(token, JWT_SECRET); } 
+    catch(e) { return reply.code(401).send(buildResponse(401, 'SxUS401', { message: 'Token inválido' })); }
+
+    try {
+        // 1. Buscamos al usuario de nuevo
+        const { data: usuario } = await supabase.from('usuarios').select('*').eq('id', decoded.sub).single();
+
+        // 2. Buscamos sus permisos actualizados
+        const { data: globales } = await supabase.from('usuario_permisos_globales').select('permisos(nombre)').eq('usuario_id', usuario.id);
+        const { data: porGrupo } = await supabase.from('grupo_usuario_permisos').select('grupo_id, permisos(nombre)').eq('usuario_id', usuario.id);
+
+        const permisosJWT = { global: globales ? globales.map(g => g.permisos.nombre) : [], grupos: {} };
+        if (porGrupo) {
+            porGrupo.forEach(item => {
+                if (!permisosJWT.grupos[item.grupo_id]) permisosJWT.grupos[item.grupo_id] = [];
+                permisosJWT.grupos[item.grupo_id].push(item.permisos.nombre);
+            });
+        }
+
+        // 3. Imprimimos el "nuevo gafete"
+        const payload = { sub: usuario.id, username: usuario.username, permisos: permisosJWT };
+        const newToken = jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
+
+        return buildResponse(200, 'SxUS200', { token: newToken, user: usuario });
+    } catch (err) {
+        reply.code(500);
+        return buildResponse(500, 'SxUS500', { message: 'Error al refrescar token.' });
+    }
+});
+
+// -------------------------------------------------------
 // START
 // -------------------------------------------------------
 const start = async () => {

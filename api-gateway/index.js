@@ -428,6 +428,10 @@ fastify.delete('/tickets/:id/comments/:comentario_id', async (request, reply) =>
     await proxyRequest(reply, SERVICES.tickets, `/tickets/${request.params.id}/comments/${request.params.comentario_id}`, request);
 });
 
+fastify.get('/auth/refresh', async (request, reply) => {
+    await proxyRequest(reply, SERVICES.users, '/auth/refresh', request);
+});
+
 // -------------------------------------------------------
 // START
 // -------------------------------------------------------
