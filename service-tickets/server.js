@@ -24,7 +24,8 @@ const createTicketSchema = {
             titulo: { type: 'string', minLength: 1 },
             descripcion: { type: ['string', 'null'] },
             prioridad: { type: 'string', enum: ['Alta', 'Media', 'Baja'] },
-            asignado_id: { type: ['integer', 'null'] }
+            asignado_id: { type: ['integer', 'null'] },
+            fecha_limite: { type: ['string', 'null'] }
         }
     }
 };
@@ -38,7 +39,8 @@ const updateTicketSchema = {
             titulo: { type: 'string', minLength: 1 },
             descripcion: { type: ['string', 'null'] },
             prioridad: { type: 'string', enum: ['Alta', 'Media', 'Baja'] },
-            asignado_id: { type: ['integer', 'null'] }
+            asignado_id: { type: ['integer', 'null'] },
+            fecha_limite: { type: ['string', 'null'] }
         }
     }
 };
@@ -125,7 +127,7 @@ fastify.get('/tickets/group/:grupo_id', async (request, reply) => {
         let query = supabase
             .from('tickets')
             .select(`
-                id, titulo, descripcion, estado, prioridad, creado_en, grupo_id,
+                id, titulo, descripcion, estado, prioridad, creado_en, grupo_id, fecha_limite, 
                 autor:autor_id ( id, nombre_completo, username ),
                 asignado:asignado_id ( id, nombre_completo, username )
             `);
@@ -220,7 +222,7 @@ fastify.post('/tickets', { schema: createTicketSchema }, async (request, reply) 
         return buildResponse(401, 'SxTK401', { message: 'Token inválido o expirado.' });
     }
 
-    const { grupo_id, titulo, descripcion, prioridad, asignado_id } = request.body;
+    const { grupo_id, titulo, descripcion, prioridad, asignado_id, fecha_limite } = request.body;
 
     try {
         const { data: nuevoTicket, error } = await supabase
@@ -232,7 +234,8 @@ fastify.post('/tickets', { schema: createTicketSchema }, async (request, reply) 
                 autor_id: usuario.sub,
                 asignado_id: asignado_id || null,
                 prioridad: prioridad || 'Media',
-                estado: 'Pendiente'
+                estado: 'Pendiente',
+                fecha_limite: fecha_limite || null
             }])
             .select()
             .single();
