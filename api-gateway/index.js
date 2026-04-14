@@ -182,6 +182,83 @@ fastify.addHook('preHandler', async (request, reply) => {
 });
 
 // -------------------------------------------------------
+// HOOK PARA LOGS Y MÉTRICAS (Guardar en B.D.)
+// -------------------------------------------------------
+fastify.addHook('onResponse', async (request, reply) => {
+    // 1. Recopilar datos de la petición
+    const endpoint = normalizarUrl(request.url); // Usamos tu función normalizadora
+    const metodo = request.method;
+    const ip = request.ip;
+    const status_http = reply.statusCode;
+    const usuario_id = request.usuario ? request.usuario.sub : null;
+    const tiempo_ms = reply.elapsedTime; // Fastify nos da el tiempo exacto en milisegundos
+
+    // Ignorar las peticiones OPTIONS (CORS) y el /health para no llenar la BD de basura
+    if (metodo === 'OPTIONS' || endpoint === '/health') return;
+
+    try {
+        // ==========================================
+        // REQUERIMIENTO A: GUARDAR LOG
+        // ==========================================
+        let error_stack = null;
+        // Si el status es 500 o mayor, intentamos extraer el error
+        if (status_http >= 500 && reply.raw.payload) {
+            error_stack = JSON.stringify(reply.raw.payload); 
+        }
+
+        await supabase.from('logs_sistema').insert([{
+            endpoint,
+            metodo,
+            usuario_id,
+            ip,
+            status_http,
+            error_stack
+        }]);
+
+        // ==========================================
+        // REQUERIMIENTO B: ACTUALIZAR MÉTRICAS
+        // ==========================================
+        
+        // 1. Buscar si ya existe la métrica para este endpoint
+        const { data: metricaActual } = await supabase
+            .from('metricas_api')
+            .select('*')
+            .eq('endpoint', endpoint)
+            .eq('metodo', metodo)
+            .maybeSingle();
+
+        if (metricaActual) {
+            // Calcular nuevo promedio: ( (PromedioAnterior * TotalAnterior) + NuevoTiempo ) / NuevoTotal
+            const nuevoTotal = metricaActual.total_requests + 1;
+            const nuevoPromedio = ((metricaActual.tiempo_promedio_ms * metricaActual.total_requests) + tiempo_ms) / nuevoTotal;
+
+            await supabase
+                .from('metricas_api')
+                .update({
+                    total_requests: nuevoTotal,
+                    tiempo_promedio_ms: nuevoPromedio,
+                    ultima_actualizacion: new Date().toISOString()
+                })
+                .eq('id', metricaActual.id);
+        } else {
+            // Si es la primera vez que se llama a este endpoint, lo insertamos
+            await supabase
+                .from('metricas_api')
+                .insert([{
+                    endpoint,
+                    metodo,
+                    total_requests: 1,
+                    tiempo_promedio_ms: tiempo_ms
+                }]);
+        }
+
+    } catch (err) {
+        // Usamos console.error para no romper el flujo principal si falla la BD de logs
+        console.error('Error al guardar log/métrica:', err.message);
+    }
+});
+
+// -------------------------------------------------------
 // RUTAS PÚBLICAS
 // -------------------------------------------------------
 fastify.get('/health', async (request, reply) => {
