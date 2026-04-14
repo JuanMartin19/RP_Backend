@@ -20,12 +20,18 @@ const SERVICES = {
 // -------------------------------------------------------
 // CORS
 // -------------------------------------------------------
+// -------------------------------------------------------
+// CORS
+// -------------------------------------------------------
 fastify.register(require('@fastify/cors'), {
-    origin: process.env.FRONTEND_URL 
-        ? [process.env.FRONTEND_URL, 'http://localhost:4200'] 
-        : true,
+    origin: [
+        'http://localhost:4200',
+        'https://rp-jade.vercel.app',
+        /\.vercel\.app$/
+    ],
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true
 });
 
 // -------------------------------------------------------
@@ -156,7 +162,19 @@ fastify.addHook('preHandler', async (request, reply) => {
     const usuario = verificarToken(request.headers.authorization);
     if (!usuario) {
         reply.code(401);
-        return reply.send(buildResponse(401, 'SxGW401', { message: 'Token no proporcionado.' }));
+        return reply.send(buildResponse(401, 'SxGW401', { message: 'Token no proporcionado o expirado.' }));
+    }
+
+    // 1. VALIDACIÓN EN TIEMPO REAL: ¿El usuario aún existe en la BD?
+    const { data: usuarioReal } = await supabase
+        .from('usuarios')
+        .select('id')
+        .eq('id', usuario.sub)
+        .maybeSingle();
+
+    if (!usuarioReal) {
+        reply.code(401);
+        return reply.send(buildResponse(401, 'SxGW401', { message: 'La cuenta ha sido eliminada del sistema.' }));
     }
 
     request.usuario = usuario;
@@ -170,6 +188,22 @@ fastify.addHook('preHandler', async (request, reply) => {
             ? (request.body?.grupo_id || request.params?.grupo_id || request.query?.grupo_id || null)
             : null;
 
+        // 2. VALIDACIÓN EN TIEMPO REAL: ¿Sigue siendo miembro de este grupo?
+        if (reglaPermiso.necesitaGrupo && grupo_id) {
+            const { data: esMiembro } = await supabase
+                .from('grupo_miembros')
+                .select('grupo_id')
+                .eq('grupo_id', grupo_id)
+                .eq('usuario_id', usuario.sub)
+                .maybeSingle();
+
+            if (!esMiembro) {
+                reply.code(403);
+                return reply.send(buildResponse(403, 'SxGW403', { message: 'Ya no perteneces a este equipo.' }));
+            }
+        }
+
+        // 3. Verificación de permisos específicos
         const tiene = tienePermiso(usuario, grupo_id, reglaPermiso.permiso);
 
         if (!tiene) {
