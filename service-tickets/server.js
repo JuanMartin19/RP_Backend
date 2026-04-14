@@ -308,7 +308,7 @@ fastify.patch('/tickets/:id/status', { schema: statusTicketSchema }, async (requ
     }
 
     const { id } = request.params;
-    const { estado } = request.body; 
+    const { estado, grupo_id } = request.body; // <-- CORRECCIÓN: Usamos el grupo_id del body
 
     try {
         const { data: ticket, error: fetchError } = await supabase
@@ -322,10 +322,19 @@ fastify.patch('/tickets/:id/status', { schema: statusTicketSchema }, async (requ
             return buildResponse(404, 'SxTK404', { message: 'Ticket no encontrado.' });
         }
 
-        const esAdmin = request.usuario.permisos?.grupos[ticket.grupo_id]?.includes('ticket:manage');
+        // ✅ CORRECCIÓN: Nueva validación estricta de permisos desde el token
+        const permisosGlobales = usuario.permisos?.global || [];
+        const permisosGrupo = usuario.permisos?.grupos[String(grupo_id)] || [];
+        
+        const tienePermisoEstado = permisosGlobales.includes('ticket:edit:state') || 
+                                   permisosGrupo.includes('ticket:edit:state');
+        
+        const esAdmin = permisosGlobales.includes('ticket:manage') || 
+                        permisosGrupo.includes('ticket:manage');
 
-        if (ticket.asignado_id !== request.usuario.id && !esAdmin) {
-            return buildResponse(403, 'Error', { message: 'Solo puedes cambiar el estado de tickets asignados a ti.' });
+        // Si NO es el asignado Y NO tiene permiso explícito Y NO es admin, lo bloqueamos
+        if (ticket.asignado_id !== usuario.sub && !tienePermisoEstado && !esAdmin) {
+            return reply.code(403).send(buildResponse(403, 'Error', { message: 'Solo puedes cambiar el estado de tickets asignados a ti.' }));
         }
 
         const estadoAnterior = ticket.estado;
@@ -368,8 +377,22 @@ fastify.delete('/tickets/:id', async (request, reply) => {
     }
 
     const { id } = request.params;
+    const { grupo_id } = request.query; // Usamos query params para validar permisos en DELETE
 
     try {
+        // ✅ CORRECCIÓN: Nueva validación estricta de permisos desde el token
+        const permisosGlobales = usuario.permisos?.global || [];
+        const permisosGrupo = usuario.permisos?.grupos[String(grupo_id)] || [];
+        
+        const tienePermisoDelete = permisosGlobales.includes('ticket:delete') || 
+                                   permisosGrupo.includes('ticket:delete') ||
+                                   permisosGlobales.includes('ticket:manage') ||
+                                   permisosGrupo.includes('ticket:manage');
+
+        if (!tienePermisoDelete) {
+            return reply.code(403).send(buildResponse(403, 'SxTK403', { message: 'No tienes permiso para eliminar tickets en este grupo.' }));
+        }
+
         const { error } = await supabase
             .from('tickets')
             .delete()
