@@ -322,11 +322,10 @@ fastify.patch('/tickets/:id/status', { schema: statusTicketSchema }, async (requ
             return buildResponse(404, 'SxTK404', { message: 'Ticket no encontrado.' });
         }
 
-        if (ticket.asignado_id !== usuario.sub) {
-            reply.code(403);
-            return buildResponse(403, 'SxTK403', { 
-                message: 'Solo puedes cambiar el estado de tickets asignados a ti.' 
-            });
+        const esAdmin = request.usuario.permisos?.grupos[ticket.grupo_id]?.includes('ticket:manage');
+
+        if (ticket.asignado_id !== request.usuario.id && !esAdmin) {
+            return buildResponse(403, 'Error', { message: 'Solo puedes cambiar el estado de tickets asignados a ti.' });
         }
 
         const estadoAnterior = ticket.estado;
